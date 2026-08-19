@@ -1,0 +1,88 @@
+{
+  "config": {
+    "level": "L0",
+    "feature_set": "full",
+    "h": 5,
+    "lookback": 20,
+    "d": 64,
+    "n_head": 4,
+    "dropout": 0.3,
+    "gate_beta": 5.0,
+    "lr": 0.0001,
+    "weight_decay": 0.0001,
+    "grad_clip": 1.0,
+    "lam_rank": 0.1,
+    "pairs_per_stock": 4,
+    "batch_days": 16,
+    "iters": 20,
+    "eval_every": 10,
+    "patience": 8,
+    "ema": 0.45,
+    "seeds": 1,
+    "device": "cuda"
+  },
+  "folds": {
+    "fold0": {
+      "ensemble": {
+        "ic": 0.0162933561950922,
+        "rank_ic": 0.016116710379719734,
+        "icir": 0.37823760509490967,
+        "rank_icir": 0.38330426812171936,
+        "n_day": 487,
+        "icir_nw": 0.2107297679767051,
+        "t_ic_nw": 4.650400638580322,
+        "turnover_raw": 0.13992273807525635,
+        "lam_sweep": {
+          "lam0.0": {
+            "rank_ic": 0.016116710379719734,
+            "ic": 0.0162933561950922,
+            "turnover": 0.13992273807525635,
+            "mean_info_age": 0.0
+          },
+          "lam0.5": {
+            "rank_ic": 0.01555736642330885,
+            "ic": 0.015551812946796417,
+            "turnover": 0.0931658074259758,
+            "mean_info_age": 1.0
+          },
+          "lam0.8": {
+            "rank_ic": 0.014476757496595383,
+            "ic": 0.013977164402604103,
+            "turnover": 0.05673381686210632,
+            "mean_info_age": 4.000000000000001
+          },
+          "lam0.9": {
+            "rank_ic": 0.013507191091775894,
+            "ic": 0.012564822100102901,
+            "turnover": 0.03712688758969307,
+            "mean_info_age": 9.000000000000002
+          }
+        }
+      },
+      "single_seed0": {
+        "ic": 0.0162933561950922,
+        "rank_ic": 0.016116710379719734,
+        "icir": 0.37823760509490967,
+        "rank_icir": 0.38330426812171936,
+        "n_day": 487
+      },
+      "seeds": [
+        {
+          "seed": 0,
+          "best_val_ema": 0.016708552604541183,
+          "iters": 20,
+          "minutes": 0.0419171134630839,
+          "rezero_alpha": NaN
+        }
+      ],
+      "mean_alpha": NaN
+    }
+  },
+  "summary": {
+    "rank_ic_median": 0.016116710379719734,
+    "rank_ic_all": [
+      0.016116710379719734
+    ],
+    "sign_consistent": true
+  }
+}

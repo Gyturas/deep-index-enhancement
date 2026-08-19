@@ -1,0 +1,18 @@
+# 数据层
+pandas>=2.0
+pyarrow>=14
+numpy>=1.24
+bottleneck>=1.3          # 滚动 median，MAD 裁剪要用
+
+# 模型
+torch>=2.0
+
+# 组合优化
+cvxpy>=1.4
+scipy>=1.10
+
+# 绘图
+matplotlib>=3.7
+
+# 行情数据（可选，仅 fetch_meta.py 需要）
+# cjpy                   # 天软/长江，需 token

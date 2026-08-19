@@ -1,0 +1,1086 @@
+\documentclass[11pt, a4paper]{ctexart}
+
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{fancyhdr}
+\usepackage[hidelinks, colorlinks=true, linkcolor=BlueLink, urlcolor=BlueLink]{hyperref}
+
+\definecolor{BlueLink}{RGB}{0,80,160}
+\definecolor{WarnBg}{RGB}{253,246,227}
+\definecolor{WarnFg}{RGB}{150,80,0}
+
+\usepackage{tcolorbox}
+\tcbuselibrary{skins, breakable}
+\newtcolorbox{warnbox}[1][]{
+  breakable, colback=WarnBg, colframe=WarnFg, boxrule=0.5pt,
+  left=6pt, right=6pt, top=4pt, bottom=4pt, #1}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small DeePM $\to$ 中证1000 策略计划书}
+\fancyhead[R]{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\setlist{itemsep=2pt, parsep=0pt, topsep=3pt}
+\newcommand{\file}[1]{\texttt{\small #1}}
+
+\title{\bfseries DeePM 迁移至中证1000 股票池\\[4pt] \large 策略计划书}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+\thispagestyle{fancy}
+
+\begin{abstract}
+\noindent
+本文给出将 Wood, Roberts, Zohren (2026) 的 DeePM 架构从 50 个全球期货品种迁移到
+中证1000 股票池的完整方案。内容包括：对原论文架构的精读与四处勘误；
+$N{=}50 \to N{=}1000$ 带来的结构性矛盾与相应的架构改造；已建成的数据层
+（来源、对齐、掩码、特征、验收测试）；A 股口径的交易成本模型；
+训练目标、优化协议与 walk-forward 设计；消融计划；以及分阶段路线图与判负标准。
+
+核心判断是：\textbf{论文的收益主要来自训练协议而非架构}。按原文消融表，
+截面与图两层合计只值 $+0.10$ 净夏普，而损失函数设计、成本内生化与种子集成
+合计值 $+0.37$。因此本方案把落地顺序反转——先搬训练协议，再验架构。
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+%======================================================================
+\section{目标与判断}
+
+\subsection{目标}
+在中证1000 成分股上，端到端学习一个直接最大化\textbf{扣费后风险调整收益}的
+仓位策略，替代“预测收益率 $\to$ 组合优化”的两阶段流程。
+
+\subsection{为什么值得做}
+DeePM 相对既有方法的三个真正增量：
+\begin{enumerate}
+  \item \textbf{决策导向的训练目标}。损失函数就是净夏普，梯度直接对齐投资人效用，
+        不存在 MSE 与效用错配的问题。
+  \item \textbf{分布鲁棒的 SoftMin 惩罚}。对最差窗口加权，等价于 EVaR 的对偶形式，
+        是对“样本内运气”最直接的对冲。
+  \item \textbf{成本内生化}。换手惩罚进入训练图，模型自己学会压低无效交易，
+        而不是事后用启发式规则削。
+\end{enumerate}
+
+\subsection{核心判断：先搬协议，后验架构}
+原论文 Table 1 的消融（满配净夏普 $0.93$，逐项拆除后的结果）：
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{llc}
+\toprule
+类别 & 拆除的组件 & 净夏普 \\
+\midrule
+\multirow{3}{*}{训练协议}
+ & 训练不计交易成本（$\gamma=0$） & \textbf{0.56} \\
+ & 去掉 SoftMin（仅 pooled 夏普） & 0.68 \\
+ & 全额成本训练（$\gamma=1$） & 0.70 \\
+ & 只用单个最优种子（$K=1$） & 0.72 \\
+\midrule
+\multirow{5}{*}{架构}
+ & 去掉 ReZero 门控 & 0.71 \\
+ & 只有截面注意力、无图 & 0.79 \\
+ & GAT 换成各向同性 GCN & 0.81 \\
+ & \textbf{完全去掉截面结构} & \textbf{0.83} \\
+ & 只有图、无截面注意力 & 0.84 \\
+ & Cascading 代替 Directed Delay & 0.84 \\
+\bottomrule
+\end{tabular}
+\caption{原论文消融结果（2010--2025 样本外，统一缩放到 10\% 年化波动）。}
+\end{table}
+
+从“完全去掉截面结构”($0.83$) 到满配 ($0.93$)，整套截面 $+$ 图的机制只值
+$+0.10$；而训练协议三项（成本、SoftMin、集成）合计从 $0.56$ 拉到 $0.93$。
+
+\begin{warnbox}
+\textbf{落地顺序因此反转}：先在现有中证1000 生产线上加装 SoftMin 损失、
+成本内生化与种子集成——这三项\textbf{不需要 DeePM 的任何架构}。
+只有在有了一条使用相同损失、相同成本处理、相同集成协议的干净基线之后，
+测出的架构差异才是架构的贡献；否则分不清是架构还是训练协议在起作用。
+\end{warnbox}
+
+%======================================================================
+\section{原论文架构精读与勘误}
+
+DeePM 是三段式：\emph{时序编码} $\to$ \emph{截面交互} $\to$ \emph{图结构正则}，
+末端接 $\text{Linear}+\tanh$ 输出仓位，整体对鲁棒净夏普做端到端优化。
+
+\subsection{静态上下文 $s_i$}
+每个资产有一个可学习的品种 embedding $e_i$，与该品种的\textbf{静态交易成本参数} $c_i$
+拼接后投影：
+\begin{equation}
+s_i = \mathrm{Linear}\bigl([\,e_i;\,c_i\,]\bigr) \in \mathbb{R}^d .
+\end{equation}
+$s_i$ 注入\textbf{两个}位置——不是一个：
+\begin{enumerate}
+  \item V-VSN 中的 FiLM 调制（见下）；
+  \item LSTM 的初始隐状态与细胞状态 $(h_{i,0}, c_{i,0}) = \tanh(W_0 s_i)$。
+\end{enumerate}
+
+\subsection{时序主干 V-VSN $\to$ LSTM $\to$ 时序注意力}
+
+\paragraph{V-VSN（向量化变量选择网络）。}条件化机制是 FiLM，不是某个激活函数：
+\begin{align}
+\mathrm{FiLM}(x_t, s_i) &= \gamma(s_i) \odot x_t + \beta(s_i), \\
+w_t &= \mathrm{Softmax}\bigl(\mathrm{Linear}(\mathrm{FiLM}(x_t, s_i))\bigr) \in [0,1]^F, \\
+v_t &= \sum_{f=1}^{F} w_{t,f}\cdot \mathrm{Conv1D}(x_t, f).
+\end{align}
+
+\begin{warnbox}
+\textbf{勘误 1}：这里的 \texttt{Conv1D} 是 \textbf{kernel\_size $=1$ 的分组卷积}，
+等价于“每个特征通道独立、时间维共享的线性投影”，\textbf{不是在时间维上做卷积}。
+写成 kernel $>1$ 的时序卷积会改变模型语义。
+\end{warnbox}
+
+\begin{warnbox}
+\textbf{勘误 2}：原文全文\textbf{没有出现 SELU}。条件化用 FiLM，
+非线性用的是 adapter 中的 SwiGLU/SiLU。若与 TFT 原版 GRN 的 ELU 混淆，
+会得到一个不同的模型。
+\end{warnbox}
+
+\paragraph{LSTM。}作为非线性低通滤波器，抑制高频噪音，初始状态由 $s_i$ 投影而来。
+
+\paragraph{ResSwiGLU Adapter。}论文复用的标准非线性块（Post-Norm）：
+\begin{equation}
+\mathcal{A}(x) = \mathrm{LN}\bigl(x + \delta\,W_2(W_1 x \odot \mathrm{SiLU}(Vx))\bigr).
+\end{equation}
+它在\textbf{四个位置}都出现：LSTM 之后、时序 MHA 之后、截面注意力之后、GNN 之后。
+
+\paragraph{时序注意力。}因果掩码的多头自注意力，
+$h^{\text{temp}}_{i,t} = \mathrm{TempMHA}(Q{=}z_{i,t},\,K{=}z_{i,\le t},\,V{=}z_{i,\le t})$，
+其中 $z_{i,t} = \mathcal{A}(h^{\text{lstm}}_{i,t})$。
+
+\subsection{截面交互与图正则是两层，不是一层}
+
+\begin{warnbox}
+\textbf{勘误 3}（最重要）：截面部分是\textbf{两个独立的 block}，顺序为
+时序 $\to$ 全连接截面注意力（滞后）$\to$ 图注意力。原文明确说图是
+“applied \emph{after} the cross-sectional attention mechanism”。
+\end{warnbox}
+
+\paragraph{(a) 全连接截面 MHA（Post-Norm + ReZero）。}
+\begin{equation}
+H^{\text{attn}}_t = \mathrm{LN}\bigl(H_t + \alpha_{\text{cross}}\cdot
+\mathrm{CrossMHA}(H_t,\ \tilde{H}_t,\ \tilde{H}_t)\bigr),
+\qquad \tilde{H}_t = H_{t-1}.
+\end{equation}
+关键在 $K/V$ 取 $t-1$ 的\textbf{Directed Delay}，把注意力约束成对
+转移熵 (Transfer Entropy) 的近似，而非同期互信息。
+
+\paragraph{(b) 宏观图 GAT（Post-Norm + ReZero）。}把邻接强度以对数偏置注入 logits：
+\begin{equation}
+\alpha_{ij,t} = \mathrm{Softmax}_j\left(
+\frac{(Q h_{i,t})^{\top}(K \tilde{h}_{j,t})}{\sqrt{d}} + \ln A_{ij}\right),
+\qquad A_{ij}=0 \Rightarrow \text{logit} = -\infty .
+\end{equation}
+
+\begin{warnbox}
+\textbf{勘误 4}：那张宏观图\textbf{不是因果图}。原文自述
+“we treat $\mathcal{G}$ as a structural regularizer rather than a claim of
+ground-truth causality”，它是按经济传导渠道手工画的先验。真正对应因果的是
+Directed Delay 的 $t-1$ 滞后。两者必须分开理解。
+\end{warnbox}
+
+%======================================================================
+\section{迁移的核心矛盾}
+
+\subsection{$N$ 从 50 变成 1000}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrr}
+\toprule
+ & 论文（期货） & 中证1000 \\
+\midrule
+资产数 $N$ & 50 & $\approx 1000$ \\
+共享时序主干的样本量 & $50\times 8800 \approx 4.4\times10^5$ & $1000\times 2700 \approx 2.7\times 10^6$ \\
+截面 pairwise 关系数 & $2{,}500$ & $1{,}000{,}000$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+方向是相反的：\textbf{时序主干因通道独立、权重共享，样本量涨了约 6 倍，
+迁移后比在期货上更有利}；\textbf{截面关系数涨了 400 倍，比在期货上更不利}。
+论文在 $N{=}50$、35 年数据的条件下尚需图先验压制过拟合。
+
+算力上同样不成立：全连接截面 MHA 是 $O(N^2)$，且每个 (batch, timestep) 各算一次。
+取 $B{=}64$、$L{=}84$、$N{=}1000$，单步约 $5.4\times 10^9$ 个 attention entry，
+单卡不可行（原文用单张 RTX 3090）。
+
+\subsection{时间跨度才是更紧的约束}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+ & 论文 & 本项目 \\
+\midrule
+时间跨度 & 1990--2025，\textbf{35 年} & 成分/行业自 2014-10，\textbf{11.6 年} \\
+SoftMin 的季度窗口块数 $B$ & $\approx 140$ & $\approx 46$ \\
+walk-forward 五年块 & 3 个样本外块 & 最多 2 块，且训练集偏短 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+后果有二：论文那套“五年一块、每 5 年全量重训”的 walk-forward 无法照搬；
+SoftMin 在 $\approx 46$ 个块上估计最差窗口，噪音显著大于原文，
+$\tau{=}0.2$ 需要重新标定（$\tau$ 越小越依赖极少数最差块，块少时极不稳定）。
+
+\paragraph{解法：分层训练。}价格面板自 2003 年起覆盖\textbf{全 A 5{,}862 只}，
+而时序主干是通道独立、全资产共享权重的，因此：
+\begin{center}
+\emph{时序主干在全 A、2003 年起训练；成分股掩码只用于定义可交易池与评估口径。}
+\end{center}
+这同时解决时间跨度（24 年）与样本量（$\sim 10^7$ 观测），
+且完全符合原文“共享 backbone $+$ existence mask 控制可交易性”的设计。
+截面与图两层因需要成分股结构，仍只能自 2014-10 起——而它们本就排在路线图第三批。
+
+%======================================================================
+\section{架构改造方案}
+
+\subsection{静态身份：属性 embedding 取代 ticker embedding}
+
+原文给 50 个品种各一个可学习 embedding 是合理的——螺纹永远是螺纹。个股不成立：
+成分股半年调整、新股上市、退市；$1000\times d{=}64$ 约 $6.4\times10^4$ 个参数
+纯粹用于记忆个股身份，在低信噪比下即过拟合装置；且新进池个股没有训练过的
+embedding，冷启动无解。
+
+\textbf{改为}：
+\begin{equation}
+e_i^{(t)} = E_{\text{ind}}\bigl[\mathrm{ind2}(i,t)\bigr]
+          + E_{\text{size}}\bigl[q_{\text{lnmv}}(i,t)\bigr]
+          + E_{\text{liq}}\bigl[q_{\text{illiq}}(i,t)\bigr]
+          + E_{\text{age}}\bigl[q_{\text{age}}(i,t)\bigr],
+\end{equation}
+其中 $q_\cdot$ 为截面分位分档（建议 10 档）。参数量从 $O(N)$ 降到 $O(\text{档数})$，
+可泛化到新成分股。原文对 $e_i$ 的定位是“condition on asset-specific effects and
+\emph{long-run heterogeneity}”——行业与市值恰是股票的 long-run heterogeneity，
+语义完全对应。
+
+$c_i$（静态成本）在股票上也不成立：小盘股冲击成本随流动性大幅变化。
+处理为动态量，见第 \ref{sec:cost} 节。
+
+\subsection{截面交互：用诱导点瓶颈替代 $O(N^2)$}
+
+三条路，按推荐度排序：
+
+\begin{enumerate}
+  \item \textbf{诱导点 / ISAB（推荐）}。个股不两两互相 attend，而是 attend 到一组
+        少量可学习的“市场状态 token” $I \in \mathbb{R}^{M\times d}$（$M \approx 16\text{--}32$）：
+        \begin{equation}
+          U_t = \mathrm{MHA}(I,\ \tilde H_t,\ \tilde H_t), \qquad
+          H^{\text{attn}}_t = \mathrm{LN}\bigl(H_t + \alpha_{\text{cross}}\cdot
+          \mathrm{MHA}(H_t,\ U_t,\ U_t)\bigr),
+        \end{equation}
+        复杂度 $O(NM)$。这与原文引用的 Set Transformer (Lee et al., 2019) 的
+        ISAB 完全一致，保持置换等变性。语义上也更合理：个股不该两两互相解释，
+        而应共同暴露在少数市场状态维度上。
+  \item \textbf{只保留图、砍掉全连接截面}。对应原文消融 $0.84$ vs 满配 $0.93$，
+        损失 $0.09$ 但立即可算。作为第一版基线合适。
+  \item \textbf{每步随机采样截面子集}。可跑，但破坏“全体资产 attend 全局状态”的
+        语义并引入采样噪音，不推荐。
+\end{enumerate}
+
+\subsection{图先验：申万二级行业}
+
+原文的图必须是确定性的、事前给定的、不拟合样本的——\textbf{因此绝不能用相关性建图}，
+那正是原文批评的对象。股票有现成的合规图：
+
+\begin{itemize}
+  \item \textbf{申万二级行业 clique}（$\approx 120$--$134$ 类，平均 7--8 只/类），
+        对应原文的 Sectoral Homophily；
+  \item 申万一级（31 类，平均 32 只/类）邻居过多，图过稠密，正则化作用弱——
+        作为消融项而非主用。
+\end{itemize}
+邻接强度 $A_{ij}$：同二级行业置 $1.0$，同一级不同二级置 $\rho \in (0,1)$（建议 $0.3$，
+作为超参），其余置 $0$。若后续接入产业链上下游数据，作为第三档边权加入，
+对应原文的 Supply Chain 通道。
+
+\begin{warnbox}
+\textbf{分类版本跨期不一致}。实测抓取 2003--2026 全区间后，
+出现的申万一级代码有 \textbf{38} 个、二级 \textbf{179} 个，
+均多于任一单一版本（现行 SW2021 为一级 31、二级 134）——原因是样本期跨越了
+申万分类体系的多次改版。
+
+处置：本项目的行业面板是\textbf{时点}的（每格记录当日所属分类代码），
+邻接矩阵按当日代码逐日构造，因此不存在用未来分类回填历史的问题。
+但由此带来两个必须注意的后果：(i) embedding 的行业查表维度按 179 类开，
+其中部分类别只在早期出现，样本量小；(ii) 改版切换日附近，
+个股所属 clique 会整体跳变，图结构不连续——建议在消融中单列一项，
+检验把样本期限制在单一分类版本内（如 2021 年之后）是否改变结论。
+\end{warnbox}
+
+\subsection{Directed Delay：保留，但依据变了}
+
+A 股 1000 只股票同时收盘，原文的异步收盘（ragged filtration）动机\textbf{完全不成立}。
+但消融显示 $t-1$（$0.93$）优于 cascading（$0.84$），原文解释是逼模型学
+impulse--response 而非同期共振。该理由在 A 股\textbf{更强}：个股同期相关性被大盘
+beta 主导，同期截面注意力几乎必然退化为“跟指数一起动”，零增量信息。
+
+\begin{center}
+\emph{结论：保留 $t-1$；依据由“防止 look-ahead”改为“防止学成 beta 共振”。}
+\end{center}
+
+\subsection{输出头：两个方案}
+
+原文输出 $p_i = \tanh(a_i)\in(-1,1)$，$w_i = p_i/\hat\sigma_i$，
+\textbf{每个资产独立定仓、不做截面归一化、非零和}——这是 CTA 做法。
+股票上直接照搬有两个问题：融券受限；$1/\hat\sigma$ 加权使低波股权重过大，
+而小盘低波常常是流动性差。
+
+\begin{description}
+  \item[方案 A（个股择时）] 保持原样，每股独立仓位，组合层面再叠等权或中性化。
+  \item[方案 B（截面打分，推荐）] 输出经截面去均值/标准化后定权：
+    \begin{equation}
+      \tilde a_{i,t} = \frac{a_{i,t} - \mathrm{mean}_{j\in\mathcal{U}_t}(a_{j,t})}
+                             {\mathrm{std}_{j\in\mathcal{U}_t}(a_{j,t}) + \varepsilon},
+      \qquad p_{i,t} = \tanh(\tilde a_{i,t}).
+    \end{equation}
+    截面去均值\textbf{完全可微}，不破坏端到端直接优化净夏普这一核心设计，
+    同时剥离指数 beta。
+\end{description}
+
+方案 B 更贴合 A 股实际。两者都应做，作为消融的一组对照。
+
+\subsection{改造总表}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+组件 & 原论文 & 本方案 \\
+\midrule
+静态身份 $e_i$ & 品种 ticker embedding & 行业$+$市值$+$流动性$+$上市年限 分档 embedding \\
+静态成本 $c_i$ & tick size $\times$ 流动性系数 & 动态成本（含印花税、佣金、冲击） \\
+V-VSN & FiLM $+$ Softmax $+$ Conv1D(k=1) & 不变 \\
+LSTM & 状态由 $s_i$ 初始化 & 不变 \\
+时序 MHA & 因果掩码 & 不变 \\
+截面交互 & 全连接 MHA，$O(N^2)$ & ISAB 诱导点瓶颈，$O(NM)$ \\
+滞后协议 & Directed Delay $t-1$ & 不变（依据改变） \\
+图 & 手工宏观传导图（50 节点） & 申万二级行业 clique（$\approx 1000$ 节点） \\
+输出头 & $\tanh$，非零和 & 截面标准化后 $\tanh$（方案 B） \\
+损失 & pooled SR $+$ SoftMin & 不变（$\tau$ 需重标定） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%======================================================================
+\section{数据层}
+
+本节描述\textbf{已经建成并通过验收}的数据层。代码在 \file{src/}，
+产出在 \file{data/aligned/} 与 \file{data/features/}。
+
+\subsection{来源与已解决的三处不一致}
+
+数据来自两个既有项目，存在三处会导致\textbf{静默错误}的不一致，已在
+\file{src/build\_panels.py} 中统一：
+
+\begin{enumerate}
+  \item \textbf{代码制式}。价格面板是 Wind 码（\file{000001.SZ}），
+        截面面板是天软码（\file{SH600004}）。直接 join 得到全 NaN 而\textbf{不报错}。
+        统一转为 Wind 码。
+  \item \textbf{日期端点}。价格面板至 2026-07-24，截面面板至 2026-07-21，
+        且 \file{mask.pkl} 末日整行为 False。统一以价格面板交易日历为主轴。
+  \item \textbf{列集合}。\file{close} 5{,}869 列、\file{vol}/\file{turn} 6{,}228 列，
+        取交集 5{,}862 列。
+\end{enumerate}
+
+价格为\textbf{后复权}（已核验：贵州茅台末值 $11{,}523$、2002 年首值 $37.5$）。
+成分股口径以\file{中证1000权重.parquet} 的非空为准（与价格面板日历完全对齐、
+末端行为正常），并与旧 \file{mask.pkl} 在重叠区间做逐格一致率交叉校验。
+
+\subsection{掩码体系}
+
+论文只有一个 existence mask $m_{i,t}$。A 股需要分层：
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lp{10.5cm}}
+\toprule
+掩码 & 定义 \\
+\midrule
+\file{A\_halted} & 有价但零成交，停牌或无量 \\
+\file{A\_oneword} & 一字板：最高$=$最低且有成交。\textbf{与 ST、板块规则无关}，
+                    是“确定买不进/卖不出”的情形 \\
+\file{A\_limit\_up/down} & 收盘触及涨/跌停：按板块$\times$ST$\times$日期确定幅度后判定 \\
+\file{A\_tradable} & 有价 $\wedge$ 有成交 $\wedge$ 非一字板 $\wedge$ 上市满 60 个交易日 \\
+\file{A\_tradable\_strict} & 在上式基础上再排除涨停与跌停日 \\
+\file{B\_member} & 中证1000 时点成分股 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{涨跌停幅度规则。}主板 $10\%$；创业板 $10\%$，2020-08-24 起 $20\%$；
+科创板 $20\%$；北交所 $30\%$；ST 使主板与改革前创业板降至 $5\%$。
+判定容差 $0.005$——涨停价按未复权价四舍五入到 $0.01$ 元，
+换算成复权收益率后有微小偏离，低价股偏离更大。
+
+\paragraph{新股。}上市后 60 个交易日内一律排除。论文的 21 日 burn-in 在个股上不足，
+且新股上市初期的涨跌幅规则特殊（注册制下前 5 日无限制）。
+
+\begin{warnbox}
+\textbf{必须做，教训在先}：不排除一字板会让策略的收益集中在买不进的封板标的上。
+本项目此前一条低流动性 CTA 线正是因此判负。\file{A\_tradable} 默认已排除一字板。
+\end{warnbox}
+
+\paragraph{与旧掩码的对表结果（已核实）。}把新构掩码与旧 \file{mask.pkl} 逐格比对，
+得到一个对建模有直接影响的发现：
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+口径 & 逐格一致率 & 日均只数（旧为 962.9） \\
+\midrule
+纯成分身份 \file{B\_member} & 97.91\% & 996.4 \\
+\file{B\_member} $\wedge$ \file{A\_tradable} & \textbf{99.09\%} & 960.1 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+差异格子中 \textbf{72\% 是停牌日}，单日最大差异出现在 2015-07-07（千股停牌）。
+即：\textbf{旧 \file{mask.pkl} 并非纯粹的成分股名单，而是“成分股 $\cap$ 可交易”的合并口径}。
+
+这不是数据错误，但把两件事揉在一起会造成建模上的混淆：DeePM 中的 $m_{i,t}$ 语义是
+\emph{可交易性}，而成分股身份决定的是\emph{评估口径与图的节点集}。本项目将两者拆开：
+\file{B\_member} 只表示“当日是否在指数成分内”，\file{A\_tradable} 只表示“当日能否成交”，
+实际使用时按需取交集。拆开后可交易口径与旧掩码的一致率从 97.91\% 升到 99.09\%，
+残差主要来自本项目额外排除的一字板与新股。
+
+\subsection{特征工程}
+
+按论文 §3.3 构造，全部在\textbf{全 A 面板}上计算（\file{src/build\_features.py}）：
+
+\begin{align}
+\text{事前波动率：} && \hat\sigma_{i,t} &= \mathrm{EWMA}_{\text{span}=63}\bigl(r_{i,t}\bigr)\text{ 的标准差}, \\
+\text{多周期收益：} && R^{(h)}_{i,t} &= \frac{P_{i,t}/P_{i,t-h}-1}{\hat\sigma_{i,t}\sqrt{h}+\varepsilon},
+  \quad h\in\{1,21,63,252\}, \\
+\text{MACD：} && \mathrm{MACD}_{S,L} &= \frac{\mathrm{EWM}_S(P)-\mathrm{EWM}_L(P)}{\mathrm{std}_{63}(P)+\varepsilon},
+  \ (S,L)\in\{(8,24),(16,48),(32,96)\}, \\
+\text{Z-score：} && Z^{(\ell)}_{i,t} &= \frac{\ln P_{i,t}-\mathrm{mean}_\ell(\ln P)}{\mathrm{std}_\ell(\ln P)+\varepsilon},
+  \quad \ell\in\{21,252\}.
+\end{align}
+MACD 随后按自身 252 日滚动标准差二次归一化。所有特征最后做稳健裁剪：
+252 日滚动 median $m_t$ 与 MAD$_t$，裁到 $[\,m_t \pm 5\times 1.4826\times \mathrm{MAD}_t\,]$。
+
+\paragraph{与论文的三处有意偏离。}
+\begin{enumerate}
+  \item \textbf{MACD 的分母}。论文 Eq.(15) 写作除以 $\hat\sigma$（前文定义为日收益率的
+        EWMA 波动），但分子 $\mathrm{EWM}_S(P)-\mathrm{EWM}_L(P)$ 是\textbf{价格量纲}，
+        除以收益率量纲不自洽。本实现按该指标原始定义
+        （Baz et al. 2015; Lim et al. 2019; Wood et al. 2023）
+        除以\textbf{价格的 63 日滚动标准差}。
+  \item \textbf{前收盘}。取 \file{close.ffill().shift(1)}。停牌期价格面板为 NaN，
+        直接 \file{shift} 会错位；ffill 后再 shift 与交易所“前收盘”口径一致，
+        且使跨停牌的复牌日收益率计算正确。
+  \item \textbf{波动率分母的地板，且不在 ffill 序列上估计}。见下。
+\end{enumerate}
+
+\paragraph{波动率分母塌陷——实测踩到的坑。}
+论文的资产是流动性极好的全球期货，几乎不存在长期停牌；A 股不同。
+首轮构建的实测结果：
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrr}
+\toprule
+分母 & 塌陷为 0 的格子 & 该特征的池化标准差 \\
+\midrule
+价格 std$_{63}$（在 ffill 序列上估计） & 702{,}357 & MACD: $9.6\times10^5 \sim 2.0\times10^7$ \\
+同上，改用带 NaN 的原始 \file{close} & 168{,}190 & --- \\
+$\hat\sigma < 0.002$ & 129{,}472 & $R^{(21)}$: $46.5$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+停牌期用 ffill 补出的常数价格段使 63 日价格标准差塌到\textbf{恰好 0}，
+除以 $0+\varepsilon$（$\varepsilon=10^{-8}$）后 MACD 爆到 $10^6\sim10^7$ 量级；
+$\hat\sigma$ 接近 0 的格子同样把多周期收益炸到几十倍。
+注意 MAD 稳健裁剪\textbf{救不了}这种情形——当窗口内多数值都是巨值时，
+滚动 median 本身就是巨值，裁剪带随之失效。
+
+\noindent 处置：
+\begin{enumerate}[label=(\alph*)]
+  \item 波动率分母一律在\textbf{真实交易日}上估计，不使用 ffill 序列；
+  \item 施加地板——$\hat\sigma \ge 0.002$（$0.2\%$/日，约 $3\%$ 年化）、
+        价格标准差 $\ge 10^{-3}\times$ 价格、MACD 二次归一化分母 $\ge 10^{-6}$；
+  \item 低于地板的格子\textbf{置 NaN 而非产出巨值}，语义是“该日波动率估计不可用”，
+        下游掩码可识别并排除；
+  \item ffill 只保留在\textbf{分子}取 $h$ 日前历史价的 \file{shift} 上。
+\end{enumerate}
+
+\paragraph{特征子集（论文 §3.3.5）。}论文明确\textbf{不同时使用全部特征}——
+V-VSN 的 Softmax 是零和竞争，喂入高度相关的特征只会稀释权重、增加噪音记忆。
+两个互斥子集：
+\begin{itemize}
+  \item \texttt{raw\_momentum}：$R^{(1,21,63,252)}$ $+$ $Z^{(21,252)}$（6 维）
+  \item \texttt{signal\_based}：$R^{(1)}$ $+$ 三组 MACD $+$ $Z^{(21,252)}$（6 维）
+\end{itemize}
+两者表现随 regime 变化很大（原文 2010--2025 是前者赢 $0.93$ vs $0.84$，
+2020--2025 反转为后者 $0.97$ vs $0.79$），必须都跑。
+
+\subsection{已知缺口}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lp{9.5cm}}
+\toprule
+缺口 & 说明与处置 \\
+\midrule
+ST 状态的时间分辨率 & 按月末采样后前值保持，ST 转换日期解析到“月”粒度。
+  影响仅限于 ST 个股的 $5\%$ 档涨跌停判定；真正不可交易的一字板由价格规则识别，
+  不依赖 ST。若需精确，可加密到周频重抓（脚本可断点续跑） \\
+产业链上下游边 & 暂无数据，图先验仅用行业 clique。作为后续增强项 \\
+分钟频/盘口数据 & 本方案为日频，不需要。若后续做执行优化再补 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{验收测试}
+
+\file{src/verify.py} 实现六组测试。第 1 组是硬性前提：
+
+\begin{warnbox}
+\textbf{重建的面板必须逐格复现源面板的原值}，否则后续一切结论作废。
+本项目此前已有多次“从存档重算后结论与原值对不上”的先例。
+\end{warnbox}
+
+\begin{enumerate}
+  \item \textbf{逐格复现}：七个价格面板与源文件在共同 (日期, 代码) 上逐格比对，
+        相对误差 $\le 10^{-6}$，NaN 位置一致。
+  \item \textbf{代码往返映射}：Wind $\leftrightarrow$ 天软双向无损；
+        旧 \file{mask.pkl} 全部代码可落入新列集。
+  \item \textbf{无未来信息}：截断历史至 $T$ 后重算特征，与全历史版本在 $\le T$ 上逐格相等。
+        这是滚动窗口最容易出错的地方。
+  \item \textbf{掩码逻辑}：\file{tradable} $\subseteq$ 有行情；
+        \file{strict} $\subseteq$ \file{tradable}；一字板确已排除；
+        成分股日均只数在 $[950, 1005]$；成分股可交易覆盖率 $> 90\%$。
+  \item \textbf{日历}：输出日历是源日历的子集，单调、无重复。
+  \item \textbf{特征分布}：每个特征标准差落在合理区间，无爆炸值。
+\end{enumerate}
+
+\paragraph{当前状态：18 / 18 全部通过。}关键数字：
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lp{9.6cm}}
+\toprule
+测试 & 结果 \\
+\midrule
+逐格复现（7 个价格面板） & 不一致 \textbf{0} / 33{,}524{,}778 格（每个面板） \\
+特征无未来信息 & 截断 @2022-06-30 重算，不一致 \textbf{0} / 1{,}893{,}200 \\
+成分股只数 & 日均 1000.0，区间 $[1000, 1000]$，有效日 2{,}852 \\
+成分股可交易覆盖率 & 日均 \textbf{96.36\%}；最低 \textbf{24.70\%} @ 2015-07-08 \\
+日历 & 2003-01-02 $\sim$ 2026-07-24，$n=5{,}719$，单调无重复 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+最低覆盖率落在 2015-07-08（股灾期间千股停牌），当日仅 24.7\% 的成分股可交易——
+这既是掩码正确工作的旁证，也提示\textbf{回测时该区间的组合约束会强烈 binding}，
+不应把这些日子的表现当作正常样本来解读。
+
+\paragraph{修复后的特征分布。}池化标准差全部落在 $[0.95, 1.7]$：
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrr|lrr}
+\toprule
+特征 & 修复前 & 修复后 & 特征 & 修复前 & 修复后 \\
+\midrule
+$R^{(1)}$   & 3.96 & \textbf{0.95} & MACD$_{8,24}$   & $9.6\times10^5$ & \textbf{1.08} \\
+$R^{(21)}$  & 46.54 & \textbf{1.01} & MACD$_{16,48}$  & $7.8\times10^6$ & \textbf{1.23} \\
+$R^{(63)}$  & 1.01 & 1.01 & MACD$_{32,96}$  & $2.0\times10^7$ & \textbf{1.68} \\
+$R^{(252)}$ & 1.51 & 1.42 & $Z^{(21)}$ / $Z^{(252)}$ & 1.30 / 1.40 & 1.30 / 1.40 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%======================================================================
+\section{交易成本模型（A 股口径）}
+\label{sec:cost}
+
+论文的结构性成本模型（tick size $\times$ 流动性系数）针对期货。A 股重写为：
+\begin{equation}
+c_{i,t} = \underbrace{\tau_{\text{stamp}}\cdot \mathbb{1}[\text{卖出}]}_{\text{印花税 }0.05\%}
+        + \underbrace{\tau_{\text{comm}}}_{\text{佣金}}
+        + \underbrace{\frac{1}{2}\,\mathrm{spread}_{i,t}}_{\text{半价差}}
+        + \underbrace{\kappa\cdot \sqrt{\frac{|\Delta w_{i,t}|\cdot \mathrm{GMV}}{\mathrm{ADV}_{i,t}}}}_{\text{冲击成本}} .
+\end{equation}
+其中冲击项采用平方根律；$\mathrm{ADV}_{i,t}$ 用 20 日均成交额，
+可直接由 \file{B\_turnover20}/\file{B\_illiq20} 导出。
+印花税单边这一非对称性必须保留——它会改变最优换手方向。
+
+净收益与论文一致：
+\begin{equation}
+R^{\text{net}}_{t+1} = \frac{1}{N_t}\sum_i m_{i,t}\,p_{i,t}\,y_{i,t+1}
+  \;-\; \frac{\gamma}{N_t}\sum_i m_{i,t}\,c_{i,t}\,\bigl|w_{i,t}-w_{i,t-1}\bigr| .
+\end{equation}
+
+\begin{warnbox}
+\textbf{$w$ 不是组合权重——冲击模型最容易踩的坑。}
+论文的 $w_{i,t} = p_{i,t}/\hat\sigma_{i,t}$ 是\textbf{风险单位}下的波动率目标敞口，
+$\hat\sigma \approx 0.025$ 时量级约 $40$，而不是求和为 1 的组合权重。
+
+首版实现把 $|\Delta w|$ 直接乘 GMV 当成交金额，得到几十亿的假成交额，
+冲击率恒定触顶，净收益退化成一条确定的大负数——冒烟测试里初始夏普
+$-43.67$、第 4 步起全部 NaN 就是这么来的。
+
+正确做法：冲击\textbf{率}要作用在真实成交金额上，
+先把 $w$ 归一化成组合占比再折算金额：
+\begin{equation}
+\mathrm{impact}_{i,t} = \kappa\sqrt{\frac{\mathrm{GMV}\cdot |\Delta w_{i,t}| \big/ \sum_j |w_{j,t}|}{\mathrm{ADV}_{i,t}}},
+\qquad
+\mathrm{cost}_{i,t} = |\Delta w_{i,t}|\,(\text{linear}_i + \mathrm{impact}_{i,t}) + (\Delta w)^-_{i,t}\,\text{stamp}_t .
+\end{equation}
+另有一处独立的 NaN 源：$\sqrt{\cdot}$ 在 $0$ 处导数无穷，
+而未换手或被掩码的格子恰好为 $0$，$\varepsilon$ 必须加在\textbf{根号内}。
+修复后成本降到 gross 波动的约 $0.1$ 倍，梯度全部有限。
+\end{warnbox}
+
+\paragraph{关于 $\gamma$。}原文结论是训练时用\textbf{打折的}成本
+（$\gamma=0.5$）优于全额（$\gamma=1$）或零成本（$\gamma=0$）。
+其依据是换手成本对仓位是凸的（原文 Proposition 1），
+故集成的成本严格低于成员成本的均值——部分正则化负担被“外包”给集成机制。
+该论证\textbf{与具体成本水平无关}，方向性结论应可迁移；但 $\gamma^\star$ 的
+具体取值须在 A 股成本结构下重新标定，扫描 $\gamma \in \{0, 0.25, 0.5, 0.75, 1\}$。
+
+%======================================================================
+\section{学习目标与优化协议}
+
+\subsection{鲁棒目标}
+\begin{equation}
+\mathcal{L}(\theta) = -\underbrace{\mathrm{SR}_{\text{pool}}(\mathcal{R})}_{\text{长期}}
+  - \lambda\cdot \underbrace{\mathrm{SoftMin}_\tau\bigl(\{\mathrm{SR}_b\}_{b=1}^{B}\bigr)}_{\text{鲁棒}},
+\qquad
+\mathrm{SoftMin}_\tau = -\tau\log\!\left(\frac{1}{B}\sum_b e^{-\mathrm{SR}_b/\tau}\right).
+\end{equation}
+$\mathrm{SR}_{\text{pool}}$ 把整个 mini-batch 视作一条连续净值曲线（不是窗口夏普的均值——
+后者是有偏且高方差的比率估计量）。SoftMin 项等价于 EVaR 的对偶形式，
+即针对一个按 KL 球重新加权历史窗口的对手做 minimax 优化。
+
+\begin{warnbox}
+$\tau$ 必须重新标定。原文 $\tau{=}0.2$ 是在 $B\approx 140$ 个季度块上得到的；
+本项目截面阶段只有 $B\approx 46$ 块，$\tau$ 过小会让梯度被极少数窗口主导。
+建议扫描 $\tau\in\{0.2, 0.5, 1.0\}$，并同时报告有效窗口数
+$B_{\text{eff}} = \exp\bigl(-\sum_b q_b\ln q_b\bigr)$，$q_b \propto e^{-\mathrm{SR}_b/\tau}$，
+以 $B_{\text{eff}} \ge 8$ 作为可接受下界。
+\end{warnbox}
+
+\subsection{优化细节}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{ll}
+\toprule
+项目 & 设定 \\
+\midrule
+优化器 & AdamW，学习率 $10^{-4}$ 固定不退火 \\
+序列长度 $L$ & 84 交易日；前 21 日为 burn-in，梯度屏蔽 \\
+样本外回测 burn-in & 63 日（原文如此，提供更长历史上下文） \\
+梯度累积 & \textbf{精确累积}：跨 micro-batch 累计 $\sum R_t$ 与 $\sum R_t^2$，
+  先算出完整逻辑 batch 的 $\mu,\sigma$ 再反传，使优化地形与显存无关 \\
+早停 & 验证夏普做 EMA 平滑（$\alpha=0.45$），$\delta_{\min}=0.001$，
+  前 20 次迭代不触发 \\
+隐维 $d_{\text{model}}$ & $\{64, 128\}$ \\
+注意力头数 & $\{2, 4\}$ \\
+Dropout & $\{0.3, 0.4, 0.5\}$ \\
+权重衰减 & $\{10^{-5}, 10^{-4}, 10^{-3}\}$ \\
+梯度裁剪 & $\{0.5, 1.0\}$ \\
+ISAB 诱导点数 $M$ & $\{16, 32\}$（本项目新增） \\
+行业边权 $\rho$（同一级不同二级） & $\{0, 0.3, 0.6\}$（本项目新增） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Walk-forward 与集成}
+
+\begin{warnbox}
+\textbf{锁定模拟盘（lockbox）：2025-01-01 起的全部数据完全空出}，
+不用于训练、验证、超参搜索、种子排序、早停，也不用于估计任何标准化统计量。
+它只在最终模型定稿后跑一次推理，作为模拟盘。
+
+这条在代码里是\textbf{强制}的，不是约定：\file{src/splits.py} 的
+\file{assert\_no\_lockbox()} 会在任何取数路径上校验日期索引，
+越界直接抛 \file{LockboxViolation}；唯一放行的入口是 \file{purpose=“paper”}。
+理由很直接——样本外结论的可信度完全取决于这段数据从未被看过，
+一旦参与过任何形式的选择，它就退化成又一个验证集。
+\end{warnbox}
+
+\paragraph{切分。}论文按五年扩张块。本项目样本期短，改为：
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{llll}
+\toprule
+折 & 训练 & 验证 & 测试 \\
+\midrule
+fold0 & 2014-10-31 $\sim$ 2018-07-31 (917d) & 102d & 2019-01-02 $\sim$ 2020-12-31 (487d) \\
+fold1 & 2014-10-31 $\sim$ 2020-05-22 (1355d) & 151d & 2021-01-04 $\sim$ 2022-12-30 (485d) \\
+fold2 & 2014-10-31 $\sim$ 2022-03-09 (1791d) & 200d & 2023-01-03 $\sim$ 2024-12-31 (484d) \\
+\midrule
+final & 2014-10-31 $\sim$ 2023-12-21 (2227d) & 248d & \textbf{锁定模拟盘 377d} \\
+\bottomrule
+\end{tabular}
+\caption{时间切分。验证集取训练段末尾 $10\%$（按时间切，不随机）。
+锁定模拟盘 = 2025-01-02 $\sim$ 2026-07-24。}
+\end{table}
+
+\begin{itemize}
+  \item \textbf{时序主干预训练}：全 A，2003--2014，作为初始化；
+  \item 三折样本外覆盖 2019--2024 共 6 年；最终模型用全部开发期数据重训，
+        只在锁定模拟盘上推理；
+  \item 训练/验证序列按\textbf{不重叠}分段，避免同一段数据同时进入两侧。
+\end{itemize}
+
+\paragraph{集成。}每个配置训练 50 个独立种子，按\textbf{验证集夏普}排序取前 25，
+对\textbf{仓位信号}做平均（不是对收益做平均）。
+
+\begin{warnbox}
+这一条是对“单种子运气”最直接的对冲。本项目此前一版 32.3\% 的结果正是因为
+单种子运气而判负废止。原文消融：$K{=}1$ 得 $0.72$，$K{=}10$ 得 $0.93$，
+$K{=}25$ 得 $0.93$——集成不是可选项。
+\end{warnbox}
+
+\subsection{缺失与变动成分的处理}
+论文的做法可直接沿用：(i) 在完整 $(i,t)$ 网格上前向填充构造张量；
+(ii) 追加存在性指示位到动态输入；(iii) 截面注意力使用 key-padding mask；
+(iv) 空间块之后显式将无效节点行置零；(v) 最终仓位再乘 $m_{i,t}$。
+
+\begin{warnbox}
+成分股必须用\textbf{时点}名单，不能用当前名单回填历史。
+本项目此前有一条公募线因成员掩码 ffill 污染而出错。
+\file{B\_member} 已按时点权重构造，并与旧掩码做过一致率交叉校验。
+\end{warnbox}
+
+%======================================================================
+\section{实现与训练成本}
+
+\subsection{精确梯度累积}
+夏普是\textbf{全局}统计量，对 micro-batch 的 loss 取平均等于优化了另一个目标。
+\file{src/train.py} 按论文 §5.3 实现两趟法：
+
+\begin{enumerate}
+  \item \textbf{第 1 趟}（\file{no\_grad}）跑完全部 micro-batch，
+        累计 $\mu,\sigma$ 与逐窗口夏普 $\{\mathrm{SR}_b\}$，
+        据此算出固定的 $\partial \mathrm{SR}/\partial R_t$ 与 SoftMin 权重 $q_b$；
+  \item \textbf{第 2 趟}（带梯度）逐 micro-batch 构造代理损失
+        \begin{equation}
+          \mathcal{L}_i = -\sum_{t\in i} g_t\cdot R_t
+                          - \lambda \sum_{b\in i} q_b \cdot \mathrm{SR}_b,
+          \qquad g_t,\,q_b \text{ 取自第 1 趟并 detach}.
+        \end{equation}
+\end{enumerate}
+各 micro-batch 代理损失之和的梯度\textbf{恒等于}整个逻辑 batch 上真实目标的梯度，
+优化地形与显存无关。代价是每步两次前向。
+
+\noindent
+一个实现细节保证两趟的块序号自然对齐：每个 84 日窗口贡献 $84-21=63$ 个有效日，
+恰好等于一个 SoftMin 块，因此扁平切块与 micro-batch 边界一致。
+
+\subsection{Dropout 与路径依赖成本的结构性冲突}
+
+\begin{warnbox}
+\textbf{标准 dropout 会伪造换手，把训练信号彻底淹没。}
+dropout 掩码在\textbf{每个时间步独立采样}，使相邻两日的仓位出现纯噪音跳变；
+而损失里有路径依赖的换手成本 $c_i|w_t - w_{t-1}|$，这份抖动被原样计成交易成本——
+且模型\textbf{学不掉}，因为那不是它的决策，是 dropout 的随机性。
+
+实测（$d{=}64$，dropout $=0.3$，4 个窗口，随机初始化）：
+
+\begin{center}
+\small
+\begin{tabular}{lrrr}
+\toprule
+ & 日均换手 $|\Delta w|$ & 成本均值 & 净夏普 \\
+\midrule
+eval（dropout 关闭） & 0.92 & 0.0022 & $-1.50$ \\
+train（标准 dropout） & \textbf{11.01} & \textbf{0.0644} & \textbf{$-18.51$} \\
+train（时间维共享掩码） & 0.71 & 0.0015 & $-0.47$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+换手 $12\times$、成本 $29\times$。修法是\textbf{变分 dropout}
+[Gal \& Ghahramani, 2016]：同一序列内所有时间步共享同一份掩码
+（\file{SharedDropout}，沿时间维广播）。仍对通道与样本做正则化，
+但不在时间维上制造假换手。同理，注意力\textbf{权重}上的 dropout
+也会让相邻时间步的注意力随机变化，全部置 0——
+正则化交给共享掩码 dropout、ReZero 与 weight decay。
+
+这个冲突在原文中同样存在（论文用 dropout $0.3\sim0.5$ 且训练时计成本），
+但文中未提及。任何“端到端优化净收益”的实现都必须处理它。
+\end{warnbox}
+
+\subsection{截面宽度：不要用全训练期的股票并集}
+\begin{warnbox}
+2014--2022 进出过中证1000 的股票共 \textbf{2{,}221} 只，而任一天只有约 1{,}000 只在册。
+若按全训练期取并集，张量宽度是 2{,}221；改为按\textbf{当前 micro-batch 的窗口}
+取并集后是 \textbf{1{,}150}。实测每步耗时从 284.9\,s 降到 141.1\,s（$-50\%$），
+且截面里不再塞满当日根本不存在的空位。
+\end{warnbox}
+
+\subsection{冒烟测试：确认梯度确实在动}
+修复上述两处后，在 fold0 上跑小配置（10 个窗口、200 只股票、$lr{=}10^{-3}$、
+14 次迭代）确认端到端可学：
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{rrrr}
+\toprule
+迭代 & 训练夏普 & 验证夏普 & $B_{\text{eff}}$ / 块数 \\
+\midrule
+1  & $-0.18$ & $+0.16$ & 3.9 / 10 \\
+2  & $+0.47$ & $+0.17$ & 2.9 / 10 \\
+4  & $+1.53$ & $+0.84$ & 2.1 / 10 \\
+6  & $+2.46$ & $\mathbf{+1.09}$ & 1.0 / 10 \\
+8  & $+3.61$ & $+0.39$ & 1.0 / 10 \\
+10 & $+4.18$ & $-0.23$ & 1.0 / 10 \\
+14 & $+5.33$ & $-0.73$ & 2.3 / 10 \\
+\bottomrule
+\end{tabular}
+\caption{冒烟测试。NaN 参数 0 个。}
+\end{table}
+
+三个结论：
+\begin{enumerate}
+  \item 训练夏普单调上升、无 NaN——梯度通路正确。
+  \item 验证夏普在第 6 次迭代见顶后掉头，是教科书式的过拟合。
+        这个配置刻意用了 $10\times$ 的学习率、只有 10 个窗口和 200 只股票，
+        过拟合来得快是预期内的；它验证了 EMA 早停确实必要且会在正确的位置触发。
+  \item \textbf{$B_{\text{eff}}$ 塌到 1.0}——SoftMin 的梯度被单个窗口垄断。
+        这正面印证了前文关于 $\tau$ 必须重标定的判断：原文 $\tau{=}0.2$ 是在
+        $B\approx140$ 个块上得到的，本项目块数少一个量级。
+        $\tau$ 扫描时必须同时监控 $B_{\text{eff}}$，以 $\ge 8$ 为可接受下界。
+\end{enumerate}
+
+\subsection{实测吞吐与外推}
+在本机（Apple M1，8 核，16\,GB，纯 CPU；\file{src/estimate\_time.py}）实测，
+配置为 fold2（最大的一折）、$N{=}1150$、21 个训练窗口、micro$=2$、$d{=}64$：
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+阶段 & 参数量 & 每步 & 单种子单折（600 迭代） & 3 折 $\times$ 50 种子 \\
+\midrule
+protocol（无截面无图） & 0.13M & 141.1\,s & 23.6\,h & 3{,}544\,h \\
+full（ISAB $+$ 行业 GAT） & 0.23M & 348.2\,s & 58.3\,h & 8{,}739\,h \\
+\bottomrule
+\end{tabular}
+\caption{CPU 实测。截面 $+$ 图使单步成本增加约 $2.5\times$。}
+\end{table}
+
+\begin{warnbox}
+下表是按经验倍数从 CPU 外推的\textbf{量级估计}，不是实测。
+本工作负载以 LSTM 与小矩阵注意力为主，GPU 加速比通常低于纯 matmul 负载，
+真实数字务必在目标机上重跑 \file{src/estimate\_time.py --device cuda}。
+（本次尝试连 runpod 未成功——Stop 重启后 IP/端口已变。）
+\end{warnbox}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrrrr}
+\toprule
+ & RTX 3090 & RTX 4090 & A100 40G & H100 \\
+\midrule
+protocol，早停后 & 85\,h & 47\,h & 35\,h & 19\,h \\
+full，早停后 & 210\,h & 117\,h & 87\,h & 48\,h \\
+\bottomrule
+\end{tabular}
+\caption{早停按跑满 $60\%$ 迭代计。}
+\end{table}
+
+\subsection{把时间压下来的四个杠杆}
+\begin{enumerate}
+  \item \textbf{种子并行}。50 个种子彼此完全独立，是 embarrassingly parallel。
+        多卡机上墙钟时间直接除以卡数——8 卡把 full 阶段从 $\sim$210\,h 压到 $\sim$26\,h。
+  \item \textbf{分阶段用不同种子数}。探索期 $K{=}10\sim20$（原文消融显示
+        $K{=}10$ 与 $K{=}25$ 的净夏普都是 0.93，差别在 $K{=}1$ 与 $K{\ge}10$ 之间），
+        只有定稿配置才跑满 50。
+  \item \textbf{先跑 protocol 阶段}。它便宜 $2.5\times$，且按路线图本来就排在第一批；
+        如果它的判负标准就没过，后两批直接省掉。
+  \item \textbf{\file{stock\_cap} 下采样}。protocol/temporal 阶段没有截面模块，
+        个股彼此独立，随机抽样股票仍给出组合收益的无偏估计，
+        只是夏普估计噪音变大。适合超参粗扫，不适合定稿。
+\end{enumerate}
+
+%======================================================================
+\section{评估、基准与消融}
+
+\subsection{指标}
+全部样本外收益序列事后统一缩放到 $10\%$ 年化波动后比较。报告：
+净夏普与毛夏普（二者之差即“执行缺口”）、CAGR、最大回撤、Calmar、
+Newey--West 调整的 $t$ 统计量、隐含平均持仓天数、
+相对基准的信息比率 IR 与 $t_\alpha$、与基准的相关系数 $\rho$。
+
+\subsection{基准}
+\begin{itemize}
+  \item \textbf{被动}：中证1000 指数；成分股等权；风险平价（等波动加权）。
+  \item \textbf{经典}：横截面动量；MACD 多尺度；两阶段“信号 $\to$ 组合”
+        （Ledoit--Wolf 收缩协方差 $+$ 带换手惩罚的 MVO）。
+  \item \textbf{既有生产线}：现有中证1000 模型（同期同费率口径）。
+  \item \textbf{深度学习}：Momentum Transformer（即 DeePM 去掉截面与图两层），
+        使用\textbf{相同}的损失、成本处理与集成协议——这是唯一能分离架构贡献的对照。
+\end{itemize}
+
+\subsection{消融清单}
+每次只改一项，从满配配置出发：
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lp{8.4cm}}
+\toprule
+组 & 消融项 \\
+\midrule
+损失 & 去掉 SoftMin；$\tau\in\{0.2,0.5,1.0\}$ \\
+成本 & $\gamma\in\{0,0.25,0.5,0.75,1\}$；印花税对称 vs 单边 \\
+集成 & $K\in\{1,10,25,50\}$ \\
+截面 & 无截面 / ISAB / 只有图 / 图与截面顺序对调 \\
+图 & 申万二级 / 申万一级 / 无图 / GAT vs GCN / $\rho\in\{0,0.3,0.6\}$ \\
+滞后 & Directed Delay ($t{-}1$) vs 同期 \\
+身份 & 属性 embedding vs 无 embedding vs 纯 ticker embedding \\
+输出 & 方案 A（独立仓位）vs 方案 B（截面标准化） \\
+特征 & \texttt{raw\_momentum} vs \texttt{signal\_based} \\
+掩码 & \file{tradable} vs \file{tradable\_strict}；含/不含一字板 \\
+其他 & 有无 ReZero 门控；有无全 A 预训练 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%======================================================================
+\section{路线图与判负标准}
+
+\subsection{第一批：训练协议（不动架构）}
+在\textbf{现有}中证1000 模型上加装：SoftMin 损失、成本内生化（扫 $\gamma$）、
+50 种子取前 25 集成。数据现已齐备。
+
+\textbf{判负标准}：若三项全加之后，样本外净夏普相对现有生产线提升不足 $0.10$，
+或 $t_\alpha < 1.0$，则说明这套训练协议在 A 股上不成立，\textbf{后两批直接放弃}。
+
+\subsection{第二批：时序主干}
+V-VSN $+$ LSTM $+$ 时序注意力，全 A 2003 年起预训练，中证1000 上微调与评估。
+输出头先用方案 B。
+
+\textbf{判负标准}：在与第一批完全相同的损失、成本、集成协议下，
+若净夏普不能超过第一批基线 $0.10$ 以上，则时序主干无增量，
+不必进入第三批——直接回到既有因子框架并只保留训练协议。
+
+\subsection{第三批：截面与图}
+ISAB 截面 $+$ 申万二级行业 GAT $+$ Directed Delay。
+
+\textbf{判负标准}：参照原文，这一层的期望增量约 $+0.10$。
+若实测增量为负或 $t$ 检验不显著，则接受“A 股个股截面结构无增量”这一结论
+并停止——这与本项目此前“纯时序、不做截面”的既有判断一致，
+不应为了复现论文而强行保留。
+
+\subsection{通用停止条件}
+任何一批出现下列情形，立即停止并复盘，不得继续叠加复杂度：
+\begin{itemize}
+  \item 验收测试（\file{src/verify.py}）任一项未通过；
+  \item 结果无法从存档逐日复现；
+  \item 收益集中在少数不可交易标的（一字板、停牌复牌日、新股）；
+  \item 单种子与集成结果差异过大（$K{=}1$ 与 $K{=}25$ 的净夏普差 $>0.3$），
+        说明结果由初始化噪音主导；
+  \item 换手率隐含的持仓天数与 alpha 衰减速度明显不匹配。
+\end{itemize}
+
+%======================================================================
+\section{风险与限制}
+
+\begin{enumerate}
+  \item \textbf{样本期短}。截面阶段仅 11.6 年、约 46 个季度块，
+        SoftMin 的最差窗口估计噪音大；walk-forward 的样本外块数少，
+        统计功效弱于原文。全 A 预训练缓解但不消除该问题。
+  \item \textbf{A 股制度变迁}。注册制、涨跌幅调整、印花税调整、
+        融券规则变化都构成结构性断点，而模型不做显式 regime 检测——
+        原文的立场是靠鲁棒损失隐式吸收，该立场在 A 股需要实证检验。
+  \item \textbf{做空可行性}。方案 B 的多空组合在 A 股融券端不一定可执行。
+        若只能做多，需在输出层加非负约束，届时截面标准化的含义随之改变，
+        应作为独立配置评估而非事后削减。
+  \item \textbf{ST 时间分辨率}。见 §5.5。
+  \item \textbf{原文结果本身的强度}。原文满配的 $t_\alpha = 1.85$
+        （100 种子版本 $1.93$），相对被动基准的显著性处在边缘。
+        迁移到样本期更短的 A 股，不应预期更强的显著性。
+\end{enumerate}
+
+%======================================================================
+\appendix
+\section{文件清单与复现命令}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{ll}
+\toprule
+路径 & 说明 \\
+\midrule
+\file{src/config.py} & 路径、样本期、代码映射、板块与涨跌停规则、特征参数 \\
+\file{src/fetch\_meta.py} & 抓取 ST 与申万行业（月末采样，断点续跑） \\
+\file{src/build\_panels.py} & 面板对齐、掩码构造、交叉校验 \\
+\file{src/build\_features.py} & 论文 §3.3 特征与稳健裁剪 \\
+\file{src/verify.py} & 六组验收测试 \\
+\file{src/splits.py} & 时间切分与\textbf{锁定模拟盘的强制校验} \\
+\file{src/costs.py} & A 股成本模型（印花税单边、佣金、半价差、平方根冲击） \\
+\file{src/dataset.py} & 面板 $\to$ 张量、窗口切分、按 micro-batch 选股票列 \\
+\file{src/model.py} & DeePM-ZZ1000（属性 embedding / ISAB / 行业 GAT） \\
+\file{src/loss.py} & pooled 夏普 $+$ SoftMin，含 $B_{\text{eff}}$ 诊断 \\
+\file{src/train.py} & 精确梯度累积、EMA 早停、多种子集成、walk-forward \\
+\file{src/estimate\_time.py} & 实测吞吐并外推训练时间 \\
+\file{data/aligned/} & 对齐后的 Tier A / Tier B 面板（parquet $+$ zstd） \\
+\file{data/features/} & 特征面板 \\
+\file{data/meta/} & 元数据、指纹、交叉校验与验收报告 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent 复现顺序：
+\begin{verbatim}
+# --- 数据层（已跑通，18/18 验收通过）
+python3 src/fetch_meta.py         # 可反复运行，已抓取的日期自动跳过
+python3 src/build_panels.py
+python3 src/build_features.py
+python3 src/verify.py             # 任一项 FAIL 即不得继续
+
+# --- 训练
+python3 src/splits.py             # 打印切分，确认锁定模拟盘边界
+python3 src/estimate_time.py --device cuda --stage protocol   # 先量目标机吞吐
+python3 src/train.py --stage protocol --device cuda           # 第一批
+python3 src/train.py --stage full --device cuda --seeds 50    # 第三批
+\end{verbatim}
+
+\section{原论文关键超参}
+序列长度 84 日，burn-in 21 日（回测 63 日）；AdamW，$\eta=10^{-4}$；
+batch size 64；迭代 1000 次；SoftMin $\tau=0.2$、$\lambda=0.1$；
+成本 scaler $\gamma=0.5$；50 种子取前 25 集成；单张 RTX 3090。
+
+\end{document}

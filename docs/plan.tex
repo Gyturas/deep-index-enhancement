@@ -1,0 +1,818 @@
+\documentclass[11pt, a4paper]{ctexart}
+
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{fancyhdr}
+\usepackage{listings}
+\usepackage[hidelinks, colorlinks=true, linkcolor=BlueLink, urlcolor=BlueLink]{hyperref}
+
+\definecolor{BlueLink}{RGB}{0,80,160}
+\definecolor{WarnBg}{RGB}{253,246,227}
+\definecolor{WarnFg}{RGB}{150,80,0}
+\definecolor{OkBg}{RGB}{240,247,240}
+\definecolor{OkFg}{RGB}{40,110,60}
+\definecolor{CodeBg}{RGB}{247,247,247}
+
+\usepackage{tcolorbox}
+\tcbuselibrary{skins, breakable}
+\newtcolorbox{warnbox}[1][]{breakable, colback=WarnBg, colframe=WarnFg,
+  boxrule=0.5pt, left=6pt, right=6pt, top=4pt, bottom=4pt, #1}
+\newtcolorbox{okbox}[1][]{breakable, colback=OkBg, colframe=OkFg,
+  boxrule=0.5pt, left=6pt, right=6pt, top=4pt, bottom=4pt, #1}
+
+\lstset{basicstyle=\ttfamily\footnotesize, backgroundcolor=\color{CodeBg},
+  frame=single, framesep=4pt, rulecolor=\color{gray!40}, breaklines=true,
+  columns=fullflexible, xleftmargin=2pt, aboveskip=6pt, belowskip=6pt}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small 中证1000 深度截面因子 · 方案 v2}
+\fancyhead[R]{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\setlist{itemsep=2pt, parsep=0pt, topsep=3pt}
+\newcommand{\file}[1]{\texttt{\small #1}}
+
+\title{\bfseries 中证1000 指数增强：深度截面因子方案\\[4pt] \large v2 —— 弃用端到端仓位框架，改做因子}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+\thispagestyle{fancy}
+
+\begin{abstract}
+\noindent
+这版方案换了框架。上一版是照搬 Oxford 那篇 DeePM（期货、端到端直接输出仓位），
+现在改成\textbf{日频截面深度因子 $\to$ 组合优化}的两阶段做法，目标产品是中证1000 指数增强。
+
+换的理由有三条：A 股实际的产品形态就是指增；截面 IC 作为诊断指标比组合夏普干净一个量级；
+以及 Chen-Pelger-Zhu 与 DeePM 两篇独立论文都指向同一个结论——目标函数怎么定比网络长什么样重要得多，
+而我们上一版把目标函数定成了组合夏普，在小样本上根本估不准。
+
+方案按 L0 $\to$ L1 $\to$ L2 三级递增，每级只加一件事，每级都有写死的判负标准。
+数据层（对齐面板、可交易掩码、特征、18/18 验收、2025 年起的锁定模拟盘）全部沿用，不重做。
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+%======================================================================
+\section{这版和上一版的区别}
+
+\subsection{上一版错在哪}
+
+上一版把 DeePM 整个搬过来：模型直接输出仓位 $p\in(-1,1)$，损失是组合的净夏普加 SoftMin
+最差窗口惩罚。在 30 只股票、三折 walk-forward 上跑出来的结果是：
+
+\begin{center}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+折 & 测试段 & 组合净夏普 & $t$ & 逐股时序 IC 中位 \\
+\midrule
+fold0 & 2019--2020 & $-0.292$ & $-0.33$ & $+0.0543$ \\
+fold1 & 2021--2022 & $+0.955$ & $+1.07$ & $+0.0421$ \\
+fold2 & 2023--2024 & $-0.373$ & $-0.42$ & $-0.0043$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+三个 $t$ 值全在 $\pm 1.1$ 以内，等于什么都没说。问题不在模型，在\textbf{指标选错了}：
+
+\begin{enumerate}
+  \item \textbf{组合夏普在小样本上估不准}。315 个交易日、30 只股票，夏普的标准误大到
+        $\pm 1$ 量级，正负号本身都不显著。更糟的是你分不清“模型没学到东西”和
+        “模型学到了但组合构建方式不对”。
+  \item \textbf{那个 IC 也是错的}。我们算的是\emph{逐股时序 IC}——某只股票的仓位序列
+        和它自己的收益序列的相关性，回答“会不会给这只股票择时”。
+        做指增要的是\emph{日频截面 IC}——某一天全部股票的打分排序和它们当天实际收益
+        排序的相关性，回答“会不会选股”。两者完全不是一回事，
+        之前拿它和 MASTER 的 0.064 对比是不成立的。
+  \item \textbf{端到端在这个数据量上不划算}。DeePM 有 35 年 $\times$ 50 个品种，
+        我们截面阶段只有 11.6 年。端到端的收益（成本内生化）需要大样本才能兑现，
+        而它的代价（目标函数噪音大）在小样本上立刻显现。
+\end{enumerate}
+
+\begin{warnbox}
+上一版三折的结果\textbf{作废}，不作为任何后续判断的依据——它测的是时序择时，
+和这版的截面选股不是同一个问题。
+\end{warnbox}
+
+\subsection{这版是什么}
+
+\begin{center}
+\small
+\begin{tabular}{lll}
+\toprule
+ & v1（弃用） & v2（本方案） \\
+\midrule
+模型输出 & 仓位 $p\in(-1,1)$ & \textbf{打分}（预测的残差收益） \\
+损失 & 组合净夏普 $+$ SoftMin & \textbf{日频截面 IC $+$ 排序 hinge} \\
+标签 & 次日波动归一化收益 & \textbf{未来 $h$ 日残差收益} \\
+组合怎么来 & 模型直接给 & \textbf{第二阶段做约束优化} \\
+主评价指标 & 组合净夏普 & \textbf{IC / RankIC / ICIR} \\
+回看窗口 & 84 天 & \textbf{20 天} \\
+截面结构 & ISAB $+$ 申万行业 GAT & 稠密截面 attention，\textbf{不建图} \\
+交易成本 & 训练时内生化 & 组合优化阶段的换手约束 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+两阶段确实丢掉了成本感知（DeePM 消融里这是最大单项），代价要认。
+缓解办法在第 \ref{sec:eval} 节：组合优化加换手约束，评估时报换手匹配后的 IC。
+
+%======================================================================
+\section{文献依据：每篇拿了什么}
+
+\begin{center}
+\small
+\begin{tabular}{p{3.4cm}p{4.2cm}p{7.2cm}}
+\toprule
+论文 & 是什么 & 我们拿什么 \\
+\midrule
+\textbf{MASTER}\newline AAAI 2024，阿里$+$上交 &
+CSI300/800，日频，intra$\to$inter 交替 attention &
+(1) 短回看 $\tau{=}8$ / 跨度 $d{=}5$；(2) 市场状态调制的特征门控；
+(3) 明确反对预定义图 \\
+\midrule
+\textbf{Chen-Pelger-Zhu}\newline Management Science &
+美股 1967--2016，无套利条件当损失 &
+核心论据：同样的深度网络，目标函数从“预测收益”换成“无套利”，
+夏普 $1.5 \to 2.6$。\textbf{别用 MSE 预测原始收益} \\
+\midrule
+\textbf{Feng et al.}\newline TOIS 2019 (RSR) &
+NASDAQ/NYSE，关系图 $+$ LSTM &
+损失设计：pointwise 回归 $+$ \textbf{pairwise 排序 hinge} \\
+\midrule
+\textbf{HIST}\newline 微软亚研 &
+中国股票，概念图 &
+\textbf{隐含概念}——不手工建图，让模型自己学分组。作为 L1 的备选 \\
+\midrule
+\textbf{A 股 Transformer}\newline arXiv 2507.07107 &
+A 股，213 因子，掩码优先 &
+消融里\textbf{掩码是最大单项 $+0.44$ 夏普}，超过任何模型或损失选择；
+涨跌停污染让 IC 虚高 18\% \\
+\midrule
+\textbf{End-to-End 组合}\newline arXiv 2507.01918 &
+美股，最小方差，维度无关网络 &
+在几百只上训练、不重训用到 1000 只。$N$ 扩展的设计思路 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{warnbox}
+\textbf{权威性提示}：A 股 Transformer 那篇是单作者未经同行评审的预印本，
+部分结果在合成面板上（3000 只合成数据夏普 2.05，真实 A 股 2022--2024 夏普 1.63）。
+它的\emph{结论}不能当定论，但它指出的\emph{机制}（不可交易价格污染上游计算）是硬的，
+而且和本项目此前一条低流动性 CTA 线的判负原因完全一致。
+\end{warnbox}
+
+\subsection{MASTER 的参考数字}
+后面定判负标准要用，先列在这里（CSI800，样本外 2020Q3--2022Q4）：
+
+\begin{center}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+方法 & IC & ICIR & RankIC & RankICIR \\
+\midrule
+LSTM & 0.028 & 0.32 & 0.039 & 0.41 \\
+GRU & 0.039 & 0.36 & 0.044 & 0.39 \\
+XGBoost & 0.040 & 0.37 & 0.047 & 0.42 \\
+Transformer & 0.040 & 0.43 & 0.048 & 0.51 \\
+GAT（预定义图） & 0.043 & 0.39 & 0.042 & 0.35 \\
+DTML & 0.039 & 0.29 & 0.053 & 0.37 \\
+\textbf{MASTER} & \textbf{0.052} & 0.40 & \textbf{0.066} & 0.48 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+读法：RankIC $0.039\sim0.048$ 是“标准方法”区间，$0.066$ 是 SOTA。
+注意\textbf{用预定义图的 GAT 是全表最差的几个之一}（RankIC 0.042，比纯 LSTM 只高 0.003，
+RankICIR 0.35 是全表最低）——这是我们决定不建行业图的直接依据。
+
+%======================================================================
+\section{问题定义}
+
+\subsection{目标}
+在中证1000 成分股上产出一个\textbf{日频截面因子} $\hat{y}_{i,t}$，
+经组合优化后构成指数增强组合，跑赢中证1000 指数。
+
+\subsection{标签：$h$ 日残差收益}
+
+\paragraph{为什么要残差化。}原始收益里绝大部分是市场 beta 和风格暴露。
+做指增你是跟指数比的，beta 是免费的，不是 alpha。
+如果直接拿原始收益当标签，模型的容量会浪费在学“大盘涨了”“小盘占优”上面。
+剥掉之后，模型只需要去找剩下的东西。
+
+这是 CPZ 那个 $1.5 \to 2.6$ 的弱化版本：他们用无套利条件把“不想解释的部分”剔出去，
+我们用回归残差做同样的事。
+
+\paragraph{怎么算。}对每个交易日 $t$，用\textbf{滚动窗口}（建议 252 日）估计
+\begin{equation}
+r_{i,t\to t+h} = \beta_{0,t} + \beta_{\text{mkt},t}\,\text{MKT}_i
+ + \beta_{\text{size},t}\,\ln \text{MV}_{i,t} + \sum_k \beta_{k,t}\,\text{IND}_{i,k,t}
+ + \varepsilon_{i,t},
+\end{equation}
+取 $\varepsilon_{i,t}$ 作为标签，再做日内截面 rank 变换（或 z-score）。
+
+\begin{warnbox}
+\textbf{回归系数必须用滚动窗口估，不能用全样本}——用全样本估系数再取残差是标准的前视陷阱，
+残差里会含有未来信息，IC 会虚高且完全不可复现。
+估计窗口必须严格落在 $t$ 之前。
+\end{warnbox}
+
+\paragraph{$h$ 取多少。}扫 $h \in \{1, 5, 10\}$，\textbf{主选 $h=5$}。
+依据：MASTER 用 5；A 股周频调仓是常见配置；$h=1$ 的信噪比太低，
+上一版用 $h=1$ 可能本身就是尺度没对准。
+
+\begin{warnbox}
+\textbf{假设标注}：$h=5$ 是我在没有确认现有生产线调仓频率的情况下取的默认值。
+若现有线是日频或月频，主选值应相应改为 1 或 20，其余设计不变。
+\end{warnbox}
+
+\subsection{标签的可交易性过滤}
+\label{sec:tradable-label}
+
+这是本方案里\textbf{单项收益最大的工程细节}（依据：A 股 Transformer 那篇的消融 $+0.44$ 夏普，
+以及本项目自己在低流动性 CTA 线上的判负经验）。
+
+若在 $t$ 日收盘无法建仓，则 $(i,t)$ 这个样本的标签\textbf{直接丢弃}，不进损失：
+
+\begin{center}
+\small
+\begin{tabular}{ll}
+\toprule
+丢弃条件 & 现有掩码字段 \\
+\midrule
+停牌 / 零成交 & \file{A\_halted} \\
+一字板（最高 $=$ 最低） & \file{A\_oneword} \\
+收盘涨停（买不进） & \file{A\_limit\_up} \\
+收盘跌停（卖不出） & \file{A\_limit\_down} \\
+上市不足 60 个交易日 & \file{A\_age} $< 60$ \\
+当日非中证1000 成分 & \file{B\_member} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+也就是默认用 \file{A\_tradable\_strict}$\;\wedge\;$\file{B\_member}，
+而不是上一版默认的 \file{A\_tradable}。
+
+\begin{warnbox}
+\textbf{v1 的漏洞}：上一版损失里用的是 \file{A\_tradable}，它只排除了一字板，
+\textbf{没有排除“收盘涨停但非一字板”的日子}。\file{tradable\_strict} 建好了却没启用。
+按那篇的机制，这会让模型去学“预测涨停”——IC 好看，但那部分收益买不进。
+\end{warnbox}
+
+\paragraph{特征侧不做同样的过滤。}涨停日的价格是真实成交价，股票确实涨了 10\%，
+把它算进动量、均线是合理的。污染发生在\textbf{标签侧}，不在特征侧。
+这一点和那篇作者的“mask-first”主张有分歧，我们的取舍写在这里备查；
+消融里保留“特征侧也过滤”这一档做验证。
+
+\subsection{损失：截面 IC $+$ 排序 hinge}
+
+\begin{equation}
+\mathcal{L} = -\frac{1}{T}\sum_{t}
+\underbrace{\frac{\sum_{i\in\mathcal{U}_t}(\hat y_{i,t}-\bar{\hat y}_t)(y_{i,t}-\bar y_t)}
+{\sqrt{\sum_i (\hat y_{i,t}-\bar{\hat y}_t)^2}\sqrt{\sum_i (y_{i,t}-\bar y_t)^2}+\epsilon}}_{\text{当日截面 IC}}
+\;+\; \alpha\,\mathcal{L}_{\text{rank}}
+\end{equation}
+
+\begin{equation}
+\mathcal{L}_{\text{rank}} = \frac{1}{T}\sum_t \frac{1}{|\mathcal{P}_t|}
+\sum_{(i,j)\in\mathcal{P}_t} \max\bigl(0,\ -(\hat y_{i,t}-\hat y_{j,t})(y_{i,t}-y_{j,t})\bigr)
+\end{equation}
+
+$\mathcal{U}_t$ 是当日通过 \S\ref{sec:tradable-label} 过滤的股票集合。
+$\mathcal{P}_t$ 是随机抽样的股票对（全配对是 $O(N^2)\approx 10^6$/天，
+抽 $4N$ 对即可，梯度方向不变、开销降两个量级）。建议 $\alpha = 0.1$，作为超参扫。
+
+\paragraph{为什么不用 MSE 当主损失。}三条理由：
+\begin{enumerate}
+  \item CPZ 的实证——同样的网络，MSE 预测收益夏普 1.5，换成有经济含义的目标 2.6；
+  \item IC 损失和预测的实际用法（排序选股）对齐，MSE 不是；
+  \item IC 损失对标签量纲不敏感，比 MSE 稳定得多，不会被少数极端收益主导。
+\end{enumerate}
+
+%======================================================================
+\section{数据层：沿用 $+$ 三处新增}
+
+\subsection{沿用（已建成并通过 18/18 验收）}
+
+\begin{center}
+\small
+\begin{tabular}{ll}
+\toprule
+产出 & 规格 \\
+\midrule
+Tier A 价格面板 & 5{,}719 交易日 $\times$ 5{,}862 只，2003-01-02 $\sim$ 2026-07-24，后复权 \\
+掩码 & \file{tradable} / \file{tradable\_strict} / \file{oneword} / \file{limit\_up/down}
+       / \file{halted} / \file{is\_st} \\
+Tier B 截面 & \file{member} / \file{weight} / \file{ind1} / \file{ind2} / \file{lnmv}
+             / \file{illiq20} / \file{turnover20} / \file{BP} \\
+特征 & 9 个：$R^{(1,21,63,252)}$、3 组 MACD、$Z^{(21,252)}$，
+       已做 252 日 MAD 稳健裁剪 \\
+验收 & 逐格复现 0 差异、无未来信息、掩码逻辑、日历、特征分布 \\
+锁定模拟盘 & 2025-01-02 $\sim$ 2026-07-24（377 日），代码强制校验 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+数据层不重做。上一版踩过的三个坑（代码制式、日期端点、波动率分母塌陷）已修并有记录。
+
+\subsection{新增 1：标签面板 \file{build\_labels.py}}
+
+\begin{lstlisting}
+输出 data/labels/
+  resid_h1.parquet   resid_h5.parquet   resid_h10.parquet   # 残差收益, float32
+  rank_h1.parquet    rank_h5.parquet    rank_h10.parquet    # 日内截面 rank, [-1,1]
+  label_mask.parquet                                        # 标签是否有效, bool
+
+步骤
+  1. fwd_ret[t] = close[t+h] / close[t] - 1        (后复权, 不 ffill 跨停牌)
+  2. 逐日做加权最小二乘, 自变量 = [1, lnmv, 申万一级哑变量]
+     - 回归窗口: 仅用 t 之前 252 日的截面回归系数的时序均值(滚动)
+     - 市场项由截距吸收(截面回归天然中性化了等权市场)
+  3. resid = fwd_ret - 拟合值
+  4. rank = 2 * (日内截面 rank / n - 0.5)          -> [-1, 1]
+  5. label_mask = tradable_strict & member & 未来 h 日内不整段停牌
+\end{lstlisting}
+
+\begin{warnbox}
+第 2 步有个必须做对的细节：\textbf{逐日截面回归的系数本身就是当日信息}，
+直接用当日系数取残差不构成前视（因为 $y$ 和 $x$ 同期，我们只是在做截面正交化）。
+但如果改成时序回归估 beta，那个 beta 必须来自 $t$ 之前的窗口。
+两种做法都可以，\textbf{不能混}。本方案选前者（逐日截面正交化），因为它简单且无歧义。
+\end{warnbox}
+
+\subsection{新增 2：市场状态向量（L2 才需要）}
+
+参照 MASTER 的构造，用三个宽基指数：中证1000（000852）、沪深300（000300）、中证500（000905）。
+每个指数取收盘价与成交额，在窗口 $d' \in \{5,10,20,30,60\}$ 上算均值与标准差，加当前值：
+\[
+3\ \text{指数} \times 2\ \text{量} \times (1 + 5\times 2) = 66\ \text{维}.
+\]
+指数序列可用 cjpy 直接拉（\file{get\_market\_data} 传裸指数代码），
+或复用 \file{中证1000择时/data/cache/} 下已有的 \file{idx\_sh000300.csv} 等。
+
+\subsection{新增 3：传统因子面板（可选，见 \S\ref{sec:roadmap}）}
+若要做“深度模型相对现有因子的增量”，需要把现有生产线的因子值导出成同口径面板，
+用于 (a) 更彻底的残差化，或 (b) 作为输入特征。这两条是\textbf{不同的实验}，
+必须分开跑，否则分不清增量来源。
+
+%======================================================================
+\section{L0：纯时序深度因子}
+
+\subsection{它是什么}
+一句话：把每只股票过去 20 天的特征喂进一个共享权重的时序编码器，输出一个分数，
+日内截面标准化后就是因子值。\textbf{没有任何截面模块}——股票之间不交换信息。
+
+这是整个方案的基线。如果 L0 就没信号，L1/L2 加的东西是在一个没有信号的表示上做加法，
+基本不可能救回来。
+
+\subsection{结构}
+
+\begin{lstlisting}
+输入
+  x     (B, N, L, F)   B=天数批  N=股票数(~1000)  L=20  F=9
+  s     (B, N, d)      属性 embedding: 申万二级 + 市值档 + 流动性档 + 上市年限档
+  mask  (B, N)         当日是否可交易(见 4.3 节)
+
+① 特征投影      x -> Linear(F, d) + 位置编码 pt        -> (B,N,L,d)
+② 静态条件化    FiLM(h, s): gamma(s) * h + beta(s)      -> (B,N,L,d)
+③ 时序编码      LSTM(d, d), 初始态由 s 投影            -> (B,N,L,d)
+                (channel-independent, 全股票共享权重)
+④ 因果注意力    causal MHA(4 头) + ResSwiGLU adapter   -> (B,N,L,d)
+⑤ 取末步        h[:, :, -1, :]                         -> (B,N,d)
+⑥ 打分          Linear(d, 1)                           -> (B,N)
+⑦ 截面标准化    在 mask 内做 z-score                   -> y_hat (B,N)
+\end{lstlisting}
+
+\paragraph{和 v1 的差异。}
+\begin{itemize}
+  \item 回看 $L$ 从 84 缩到 \textbf{20}。依据：MASTER 用 8，我们取 20 作为折中，
+        保留一个月的记忆。burn-in 相应从 21 缩到 5。
+  \item 输出头从 $\tanh$ 仓位改成\textbf{打分}，末端只做截面标准化，不做 $\tanh$
+        （$\tanh$ 会压缩尾部，而排序恰恰关心尾部）。
+  \item 删掉 V-VSN 的 softmax 特征竞争，改成简单的线性投影 $+$ FiLM。
+        理由：v1 的 V-VSN 是为 6 维特征设计的零和竞争，特征多了以后会稀释；
+        MASTER 的门控（L2）是更好的版本，留到那时再加。
+  \item \textbf{保留}：LSTM 由 $s$ 初始化、因果掩码、ResSwiGLU adapter、
+        时间维共享的 dropout（见下）。
+\end{itemize}
+
+\begin{warnbox}
+\textbf{dropout 必须用时间维共享掩码。}v1 实测：标准 dropout 让日均换手从 0.92 涨到 11.01、
+成本涨 29 倍，因为掩码在每个时间步独立采样，制造了纯噪音的仓位跳变。
+本方案虽然不在训练里算成本，但同样的抖动会污染时序表示，
+\file{SharedDropout}（沿时间维广播）继续沿用。注意力权重上的 dropout 一律置 0。
+\end{warnbox}
+
+\subsection{判负标准}
+三折样本外，与三个基准比较：
+
+\begin{center}
+\small
+\begin{tabular}{lp{9.5cm}}
+\toprule
+必须满足 & 说明 \\
+\midrule
+RankIC 中位 $> 0.03$ & MASTER 表里 LSTM/GRU 一档是 $0.039\sim0.044$。
+  中证1000 比 CSI800 更小更噪，$0.03$ 是“确实有东西”的下限 \\
+RankICIR $> 0.3$ & 稳定性，防止 IC 靠少数几天撑起来 \\
+三折符号一致 & 三折 RankIC 全为正。这一条比绝对值更重要 \\
+打赢传统因子合成 & 用同样的标签、同样的切分，现有因子等权合成的 RankIC \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{warnbox}
+四条有任何一条不满足，\textbf{L1/L2 直接放弃}，回到既有因子框架。
+不要因为“再加个模块可能就好了”而继续——那是上一版失控的原因。
+\end{warnbox}
+
+%======================================================================
+\section{L1：加截面交互}
+
+\subsection{它加什么}
+让同一天的股票之间交换信息。L0 里每只股票是孤立的，L1 之后一只股票的分数
+可以依赖当天其他股票的状态。
+
+\subsection{两个变体，都要跑}
+
+\paragraph{变体 A（简单版，先做这个）。}在 L0 的第 ⑤ 步之后、⑥ 步之前插一层：
+
+\begin{lstlisting}
+H = h[:, :, -1, :]                              # (B, N, d)  取末步
+A = MHA(H, H, H, key_padding_mask=~mask)        # 截面自注意力, 4 头
+H = LayerNorm(H + alpha_rezero * A)             # ReZero, alpha 初始化为 0
+H = ResSwiGLU(H)
+score = Linear(H)                                # -> (B, N)
+\end{lstlisting}
+
+复杂度 $O(N^2) = 10^6$ 每天，完全可算。ReZero 让这层初始为恒等映射，
+优化器只在确有增益时才引入截面交互——这同时也是一个天然的诊断：
+训练完看 $\alpha_{\text{rezero}}$ 有没有离开 0。
+
+\paragraph{变体 B（MASTER 式，逐时间步）。}在第 ④ 步之后、⑤ 步之前：
+
+\begin{lstlisting}
+H = h.permute(0,2,1,3).reshape(B*L, N, d)       # 每个时间步一个截面
+A = MHA(H, H, H, key_padding_mask=...)
+H = LayerNorm(H + alpha * A)
+H = H.reshape(B, L, N, d).permute(0,2,1,3)      # 还原
+\end{lstlisting}
+
+复杂度 $O(N^2 L) = 2\times10^7$ 每天。这是 MASTER 声称的核心贡献——
+股票之间的关联是“瞬时且跨时间”的，先把序列汇总成一个向量会把它抹掉。
+$L{=}20$ 时这个开销可以接受（v1 的 $L{=}84$、$N{=}1150$ 是 $1.1\times10^8$，
+所以才需要 ISAB 瓶颈；缩短回看之后瓶颈不再必要）。
+
+\subsection{明确不做：预定义行业图}
+
+\begin{warnbox}
+v1 的方案是“申万二级行业 clique $+ \ln A_{ij}$ 偏置”。\textbf{这版删掉。}
+
+依据有两条。MASTER 的论证：同行业的不同股票当天可能反向变动；
+预定义关系对新上市、退市、主业变更的股票不适用。
+更硬的是它表里的数字：\textbf{用预定义图的 GAT 在 CSI800 上 RankIC 0.042，
+RankICIR 0.35，是全表最低}，比纯 LSTM 只高 0.003。
+
+DeePM 的宏观图之所以成立，是因为 50 个品种之间的传导是物理的
+（原油$\to$PTA 是投入产出关系）。同属“申万半导体”的两只 A 股没有这种强度的联系。
+
+行业信息改走属性 embedding（作为条件），不建图。
+若后续确实需要结构，走 HIST 的\textbf{隐含概念}路线——让模型自己学分组，
+而不是手工指定。
+\end{warnbox}
+
+\subsection{判负标准}
+相对 L0（同切分、同种子协议、同标签）：
+\begin{itemize}
+  \item RankIC 增量 $> 0.005$，且\textbf{三折符号一致}；
+  \item ReZero 门 $\alpha$ 显著离开 0（否则说明模型自己判定这层没用）；
+  \item 变体 A 与 B 至少一个满足。
+\end{itemize}
+不满足则保留 L0，跳过 L2 里依赖截面的部分。
+
+%======================================================================
+\section{L2：市场状态门控}
+
+\subsection{它加什么}
+MASTER 最有价值的一个设计：\textbf{特征的有效性随市况变化}。
+均线因子在高波动期有用、在震荡市没用——让模型按当前市场状态动态放大或抑制每一维特征。
+
+\subsection{怎么加}
+在 L0 的第 ① 步之前，对原始特征做一次缩放：
+
+\begin{lstlisting}
+m_t   (B, F_mkt=66)                             # 市场状态向量, 见 5.3 节
+alpha = F * softmax(W @ m_t + b, temperature=beta)      # (B, F), 和为 F
+x_scaled = alpha.unsqueeze(1).unsqueeze(2) * x          # 广播到 (B,N,L,F)
+\end{lstlisting}
+
+三个要点：
+\begin{itemize}
+  \item \textbf{乘以 $F$}：让权重和为 $F$ 而不是 1，这样与“每维都是 1”的均匀分布对比，
+        $\alpha_f > 1$ 是放大、$< 1$ 是抑制。直接用 softmax 会把所有特征都缩小。
+  \item \textbf{温度 $\beta$}：控制分布的尖锐程度。MASTER 在 CSI300 用 5、CSI800 用 2。
+        我们扫 $\{2, 5, 10\}$。
+  \item \textbf{全市场共享一份 $\alpha$}：只随时间变，不随股票变。这和 v1 的 FiLM 是
+        \textbf{正交}的两个条件——FiLM 问“哪类股票适合什么因子”，
+        门控问“什么市况下哪类因子有效”。两者可以同时存在。
+\end{itemize}
+
+\subsection{判负标准}
+相对 L1 最优配置：RankIC 增量 $> 0.003$ 且三折符号一致。
+另外看诊断量：$\alpha$ 的时序方差应该显著大于 0（否则门控退化成常数，等于没加）。
+
+%======================================================================
+\section{L3（可选）：end-to-end 对照}
+
+等 L0/L1/L2 出了数之后，用\textbf{完全相同}的特征、切分、掩码，跑一版端到端优化组合的模型
+（复用 v1 的 \file{loss.py} 与 \file{costs.py}），直接回答一个有独立价值的问题：
+
+\begin{center}
+\emph{DeePM 与 CPZ 都主张的“目标函数比架构重要”，在 A 股指增上到底成不成立？}
+\end{center}
+
+这不是必做项，但它是这个项目唯一能贡献一点通用结论的地方。排在最后，
+因为它需要前面几级把表示学好才有意义。
+
+%======================================================================
+\section{训练协议}
+
+\subsection{切分：锁定模拟盘不变}
+
+\begin{center}
+\small
+\begin{tabular}{llll}
+\toprule
+折 & 训练 & 验证 & 测试 \\
+\midrule
+fold0 & 2014-10-31 $\sim$ 2018-07-31 & 2018 下半年 & 2019-01 $\sim$ 2020-12 \\
+fold1 & 2014-10-31 $\sim$ 2020-05-22 & 2020 年中 & 2021-01 $\sim$ 2022-12 \\
+fold2 & 2014-10-31 $\sim$ 2022-03-09 & 2022 上半年 & 2023-01 $\sim$ 2024-12 \\
+\midrule
+final & 2014-10-31 $\sim$ 2024-12-31 & 末尾 10\% & \textbf{锁定模拟盘 2025-01-02 $\sim$ 2026-07-24} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{okbox}
+\textbf{2025 年起的数据完全不可见}，不用于训练、验证、超参搜索、种子排序、早停，
+也不用于估计任何标准化统计量。\file{splits.assert\_no\_lockbox()} 在所有取数路径上强制校验，
+越界抛 \file{LockboxViolation}，唯一放行入口是 \file{purpose=“paper”}。这条从 v1 原样保留。
+\end{okbox}
+
+\subsection{v1 踩过的坑，这版怎么避}
+
+\begin{center}
+\small
+\begin{tabular}{p{4.2cm}p{10.4cm}}
+\toprule
+v1 的问题 & v2 的处理 \\
+\midrule
+验证段只有 1--2 个窗口（63--126 天），选种子等于抛硬币
+（四个种子 val 跨度 $0.758\sim2.103$，全在一个标准误 2.0 以内）&
+改用\textbf{截面 IC} 做验证指标。IC 的样本量是“天数 $\times$ 股票数”而非“天数”，
+同样长度的验证段，估计精度高一个量级。验证段仍拉长到 $\ge$ 4 个月 \\
+\midrule
+只有 4 个种子，取前 2 &
+\textbf{12 个种子，全部平均，不做选择}。验证集短的时候选择带来的噪音大于收益 \\
+\midrule
+30 只股票，特异性风险极大 &
+\textbf{全池 $\approx$ 1000 只}。截面任务本来就需要全池，这不是可选项 \\
+\midrule
+迭代级进度看不到，跑了 50 分钟才知道卡住 &
+每 $k$ 步打印训练/验证 IC 与耗时，\file{python3 -u} 强制不缓冲 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{超参}
+
+\begin{center}
+\small
+\begin{tabular}{ll}
+\toprule
+项目 & 设定 \\
+\midrule
+优化器 & AdamW，$lr = 10^{-4}$（$\{10^{-3},10^{-4},10^{-5}\}$ 扫） \\
+隐维 $d$ & 64（$\{64,128,256\}$ 扫） \\
+注意力头 & 4 \\
+回看 $L$ & 20（$\{10,20,40\}$ 扫） \\
+burn-in & 5 \\
+Dropout & 0.3，\textbf{时间维共享掩码} \\
+权重衰减 & $10^{-4}$ \\
+梯度裁剪 & 1.0 \\
+排序损失权重 $\alpha$ & 0.1（$\{0, 0.1, 0.3\}$ 扫） \\
+种子 & 12，全部平均 \\
+早停 & 验证 RankIC 的 EMA（$\alpha_{\text{smooth}}=0.45$），patience 15 次评估 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%======================================================================
+\section{评估、基准与消融}
+\label{sec:eval}
+
+\subsection{指标}
+
+\paragraph{因子层面（主）。}IC、RankIC、ICIR、RankICIR，全部按日频截面计算后对时间聚合。
+这套和 MASTER 直接可比。另加：
+\begin{itemize}
+  \item \textbf{分层单调性}：按因子值分十层，看各层平均残差收益是否单调；
+  \item \textbf{因子自相关}：$\text{corr}(\hat y_t, \hat y_{t-1})$，直接对应换手率；
+  \item \textbf{换手匹配后的 IC}：把因子做平滑使其自相关达到指定水平后再算 IC。
+        两阶段丢掉了成本感知，这个指标补回一部分诊断能力——
+        一个 IC 高但自相关极低的因子，扣完费可能一文不值。
+\end{itemize}
+
+\paragraph{组合层面。}超额年化收益、信息比率、跟踪误差、最大相对回撤、
+双边年化换手率、Newey-West 调整的 $t_\alpha$。
+
+\subsection{基准}
+\begin{itemize}
+  \item 中证1000 指数本身（等权与市值加权）；
+  \item 传统因子等权合成（同标签、同切分）；
+  \item \textbf{现有生产线模型}（这是最重要的一条——如果打不赢它，这个项目没有意义）；
+  \item LSTM / GRU 简单基线（对应 MASTER 表里的那一档）；
+  \item XGBoost / LightGBM 在同样特征上的表现。
+\end{itemize}
+
+\subsection{组合优化（第二阶段）}
+Markowitz $+$ Ledoit-Wolf 收缩协方差，约束：
+行业中性（申万一级，$\pm 1\%$）、市值中性、跟踪误差上限（$5\%$）、
+个股权重上限（指数权重 $+1\%$）、双边换手上限（单日 $10\%$）。
+这套你生产线上应该已有，直接复用，不重造。
+
+\subsection{消融清单}
+每次只改一项：
+
+\begin{center}
+\small
+\begin{tabular}{lp{9cm}}
+\toprule
+组 & 消融项 \\
+\midrule
+标签 & $h \in \{1,5,10\}$；残差化程度（仅市场 / 市场$+$市值$+$行业 / 全套传统因子）；
+       rank 变换 vs z-score \\
+掩码 & \file{tradable\_strict} vs \file{tradable}；含/不含涨跌停；特征侧是否也过滤 \\
+损失 & 纯 IC / IC$+$hinge($\alpha$ 扫) / 纯 MSE（验证 CPZ 的论断） \\
+架构 & L0 / L1-A / L1-B / L2；回看 $L$；有无 FiLM；有无 ReZero \\
+特征 & 现有 9 维 / 加传统因子 / \texttt{raw\_momentum} vs \texttt{signal\_based} \\
+集成 & 种子数 $\{1, 6, 12\}$；全平均 vs 取前半 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%======================================================================
+\section{路线图}
+\label{sec:roadmap}
+
+\begin{center}
+\small
+\begin{tabular}{llp{7.4cm}}
+\toprule
+阶段 & 产出 & 内容 \\
+\midrule
+D & 标签面板 & \file{build\_labels.py}：残差收益 $\times$ 3 个 $h$ $+$ 标签掩码 $+$ 验收测试 \\
+L0 & 纯时序因子 & 新 \file{model\_v2.py} $+$ \file{loss\_ic.py}；三折 $\times$ 12 种子 \\
+L1 & $+$ 截面 & 变体 A 与 B；ReZero 门诊断 \\
+L2 & $+$ 市场门控 & 需先拉指数数据构造 66 维市场状态 \\
+P & 组合与模拟盘 & 第二阶段优化；最终模型在锁定模拟盘上跑一次推理 \\
+L3 & end-to-end 对照 & 可选 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{通用停止条件。}任一阶段出现下列情形立即停止复盘，不得继续叠加复杂度：
+\begin{itemize}
+  \item 验收测试任一项未通过；
+  \item 结果无法从存档逐日复现；
+  \item IC 主要来自不可交易的样本（做 \file{tradable\_strict} 前后的 IC 对比，
+        差异过大说明在学涨停）；
+  \item 因子自相关过低（换手匹配后 IC 大幅衰减）；
+  \item 三折 RankIC 符号不一致。
+\end{itemize}
+
+%======================================================================
+\section{风险与已知限制}
+
+\begin{enumerate}
+  \item \textbf{两阶段丢掉成本感知}。DeePM 消融里训练时不计成本会让净夏普从 0.93 掉到 0.56，
+        是最大单项。我们靠组合优化的换手约束和“换手匹配后 IC”补，但补不满。
+        这是换取诊断清晰度付出的代价，L3 用来量化它到底值多少。
+  \item \textbf{样本期短}。截面阶段只有 2014-10 起约 10 年（开发期），
+        三折样本外覆盖 2019--2024 共 6 年。MASTER 用了 2008--2022 共 14 年。
+  \item \textbf{申万分类跨版本不一致}。全区间一级 38 类、二级 179 类，多于现行 SW2021 的 31/134，
+        因为样本期跨了申万改版。面板是时点的所以无回填问题，
+        但改版切换日附近个股所属类别会整体跳变，做行业中性时要注意。
+  \item \textbf{残差化的口径敏感}。剥得越多，剩下的信号越弱，模型可能什么都学不到；
+        剥得越少，IC 里混的 beta 越多，看起来好但组合层面兑现不了。
+        这是个需要实证定夺的取舍，不是可以先验决定的。
+  \item \textbf{MASTER 的参考数字不完全可比}。它是 CSI300/800（大中盘），
+        我们是中证1000（小盘）；它的测试段是 2020Q3--2022Q4 共 10 个季度且只切了一次；
+        它的 AR/IR 是\textbf{毛的}，不计交易成本。拿它的 IC 当参照可以，
+        拿它的组合收益当参照不行。
+\end{enumerate}
+
+%======================================================================
+\appendix
+\section{目录结构与文件清单}
+
+\begin{lstlisting}
+deep-index-enhancement/
+|- README.md
+|- docs/
+|  |- plan.tex / plan.pdf          <- 本文档（当前方案 v2）
+|  |- refs/                        <- 参考文献 8 篇 PDF
+|  |- archive/
+|     |- plan-v1-deepm.tex/.pdf    <- 已弃用的 v1（端到端仓位框架）
+|- src/                            <- 现役代码
+|  |- legacy/                      <- v1 代码，L3 对照时复用
+|- data/{aligned,features,labels,meta,cache}
+|- runs/                           <- 检查点与集成记录
+|- logs/
+\end{lstlisting}
+
+\begin{center}
+\small
+\begin{tabular}{lll}
+\toprule
+文件 & 状态 & 说明 \\
+\midrule
+\file{src/config.py} & 沿用 & 路径、代码映射、板块与涨跌停规则 \\
+\file{src/fetch\_meta.py} & 沿用 & ST 与申万行业 \\
+\file{src/build\_panels.py} & 沿用 & 面板对齐、掩码、交叉校验 \\
+\file{src/build\_features.py} & 沿用 & 特征与稳健裁剪 \\
+\file{src/splits.py} & 沿用 & 切分与锁定模拟盘强制校验 \\
+\file{src/costs.py} & 沿用 & A 股成本模型（组合优化、换手匹配 IC、L3 都要用） \\
+\file{src/verify.py} & 沿用$+$扩 & 六组验收，需为标签加第 7 组 \\
+\file{src/dataset.py} & 改 & 改为按“天”批而非按“窗口”批，产出标签 \\
+\midrule
+\file{src/build\_labels.py} & \textbf{新} & 残差收益标签 \\
+\file{src/market\_state.py} & \textbf{新} & 66 维市场状态（L2 用） \\
+\file{src/model\_v2.py} & \textbf{新} & L0/L1/L2 三级，用开关控制 \\
+\file{src/loss\_ic.py} & \textbf{新} & 截面 IC $+$ 排序 hinge \\
+\file{src/train\_v2.py} & \textbf{新} & 训练驱动 \\
+\file{src/portfolio.py} & \textbf{新} & 第二阶段组合优化 \\
+\midrule
+\file{src/legacy/model.py} & 归档 & v1 的 ISAB $+$ 行业 GAT \\
+\file{src/legacy/loss.py} & 归档 & v1 的组合净夏普 $+$ SoftMin \\
+\file{src/legacy/train.py} & 归档 & v1 训练驱动（精确梯度累积） \\
+\file{src/legacy/estimate\_time.py} & 归档 & 吞吐测速 \\
+\file{src/legacy/single\_stock.py} & 归档 & v1 的时序择时可行性测试 \\
+\file{src/legacy/run\_feasibility.py} & 归档 & 同上的三折驱动 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+\file{src/legacy/} 下的脚本已把 \file{sys.path} 指向上一层，可直接运行，
+用于 L3 的 end-to-end 对照。
+
+\paragraph{复现顺序。}
+\begin{lstlisting}
+# 数据层（已跑通，18/18 验收通过，不需重做）
+python3 -u src/build_panels.py
+python3 -u src/build_features.py
+python3 -u src/verify.py
+
+# v2 新增
+python3 -u src/build_labels.py          # 残差标签
+python3 -u src/train_v2.py --level L0   # 再依次 L1 / L2
+\end{lstlisting}
+
+\section{v1 遗留的三条硬教训}
+这三条是实测踩出来的，v2 直接继承，不要重犯：
+
+\begin{enumerate}
+  \item \textbf{波动率分母不能在 ffill 序列上估计}。停牌期 ffill 出的常数价格段让
+        63 日价格标准差塌到恰好 0（702{,}357 个格子），除以 $0+\varepsilon$ 使 MACD
+        爆到 $10^6\sim10^7$。而且 MAD 稳健裁剪\textbf{救不了}——窗口内多数是巨值时，
+        滚动 median 本身就是巨值。分母只在真实交易日上估，低于地板置 NaN。
+  \item \textbf{dropout 必须时间维共享}。标准 dropout 让日均换手 $0.92\to11.01$、
+        成本涨 29 倍。
+  \item \textbf{旧 \file{mask.pkl} 是“成分股 $\cap$ 可交易”的合并口径}，不是纯成分名单。
+        差异格子 72\% 是停牌日。v2 继续用拆开的 \file{B\_member} 与 \file{A\_tradable*}。
+\end{enumerate}
+
+\section{待你拍板的四项}
+本文档中已按默认值写作，以下四项若与实际不符，相应章节需要调整：
+
+\begin{enumerate}
+  \item \textbf{$h$ 取 5}（\S3.2）。取决于现有生产线的调仓频率。
+  \item \textbf{残差剥“市场$+$市值$+$行业”}（\S3.2）。备选是只剥市场，或剥全套传统因子。
+  \item \textbf{传统因子先不进特征}（\S5.4）。残差化与进特征是两条不同的实验，先做残差化。
+  \item \textbf{end-to-end 排在最后}（\S8）。可选项。
+\end{enumerate}
+
+\end{document}

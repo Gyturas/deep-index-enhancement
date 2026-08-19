@@ -1,0 +1,19 @@
+# 数据（3.5GB，全部可由 src/ 重建）
+data/
+runs/**/*.npz
+runs/**/*.npy
+logs/*.out
+logs/pod/*.out
+*.pyc
+__pycache__/
+.DS_Store
+
+# 参考文献 PDF（版权，不入库）
+docs/refs/
+
+# LaTeX 中间产物
+docs/*.aux
+docs/*.log
+docs/*.out
+docs/*.toc
+logs/
